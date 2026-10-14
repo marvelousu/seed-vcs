@@ -1,6 +1,7 @@
 """Standard-library HTTP client with revision-pinned automatic read capture."""
 
 import json
+from http.client import IncompleteRead
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
@@ -72,7 +73,7 @@ class Client:
                             )
                         )
                     ) from exc
-            except (URLError, TimeoutError, ConnectionError) as exc:
+            except (URLError, TimeoutError, ConnectionError, IncompleteRead) as exc:
                 if attempt == 2:
                     raise SeedError(
                         "Service connection failed after three attempts"

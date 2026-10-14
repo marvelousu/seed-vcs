@@ -12,6 +12,7 @@ import time
 import urllib.request
 
 from seed_client import Client
+from benchmark import run
 
 
 def command(*args):
@@ -25,12 +26,13 @@ def main():
         config = Path(directory).resolve() / "credentials.json"
         token = secrets.token_urlsafe(32)
         repo = "container_" + secrets.token_hex(6)
+        bench_repo = repo + "_bench"
         config.write_text(
             json.dumps(
                 [
                     {
                         "sha256": hashlib.sha256(token.encode()).hexdigest(),
-                        "repositories": [repo],
+                        "repositories": [repo, bench_repo],
                         "permissions": ["read", "write", "create"],
                     }
                 ]
@@ -83,6 +85,20 @@ def main():
                 assert list(pool.map(submit, range(16))) == ["landed"] * 16
             assert len(client.files()["files"]) == 16
             assert client.read("files/7") == b"7"
+            result = run(
+                "http://127.0.0.1:7331",
+                bench_repo,
+                token,
+                files=150,
+                proposals=32,
+                clients=8,
+                batch=4,
+            )
+            assert (
+                result["verified"]
+                and result["completed"] == 32
+                and not result["errors"]
+            )
             print("Container HTTP/PG/volume smoke passed: 16 concurrent proposals")
         finally:
             subprocess.run(
