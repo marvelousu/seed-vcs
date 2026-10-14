@@ -28,3 +28,43 @@ jobs:
         run: python -m unittest -v test_seed.py
       - name: Run two-agent demonstration
         run: python demo.py
+      - name: Install service dependencies
+        run: pip install -r requirements-server.txt httpx==0.28.1 && pip install --no-deps -e .
+      - name: Run HTTP and agent session contracts
+        run: python -m unittest -v test_service.ServiceTests
+
+  postgres:
+    name: PostgreSQL / HTTP / container
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: seed
+          POSTGRES_PASSWORD: seed-test-only
+          POSTGRES_DB: seed
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U seed -d seed"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      SEED_TEST_DATABASE_URL: postgresql://seed:seed-test-only@127.0.0.1:5432/seed
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install service dependencies
+        run: pip install -r requirements-server.txt httpx==0.28.1 && pip install --no-deps -e .
+      - name: Run real PostgreSQL contracts
+        run: python -m unittest -v test_service.PostgresServiceTests
+      - name: Build service image
+        run: docker build -t seed-service .
+      - name: Exercise container HTTP and persistent objects
+        run: python scripts/container_smoke.py
+        env:
+          PYTHONPATH: .

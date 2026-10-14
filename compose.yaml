@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: seed
+      POSTGRES_DB: seed
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - metadata:/var/lib/postgresql
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U seed -d seed"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  server:
+    build: .
+    environment:
+      SEED_DATABASE_URL: postgresql://seed:${POSTGRES_PASSWORD}@postgres:5432/seed
+      SEED_AUTH_FILE: /run/seed/credentials.json
+      SEED_POOL_SIZE: '16'
+    ports:
+      - 127.0.0.1:7331:7331
+    volumes:
+      - objects:/data
+      - ./.seed/credentials.json:/run/seed/credentials.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7331/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+volumes:
+  metadata:
+  objects:

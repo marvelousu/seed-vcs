@@ -3,3 +3,8 @@ __pycache__/
 *.db-wal
 *.db-shm
 artifacts/
+.venv/
+*.egg-info/
+.seed/
+auth*.json
+credentials*.json

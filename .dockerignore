@@ -1,0 +1,8 @@
+.git
+.venv
+.seed
+artifacts
+__pycache__
+*.egg-info
+auth*.json
+credentials*.json

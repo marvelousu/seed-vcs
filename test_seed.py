@@ -210,6 +210,27 @@ class SeedTests(unittest.TestCase):
         self.assertEqual(self.store.head(), self.genesis)
         self.assertEqual(self.store.manifest(), {})
 
+    def test_uploaded_refs_preserve_proposal_identity(self):
+        payload = b"same content"
+        first = self.store.propose(self.genesis, {"file": payload}, message="same")
+        blob = self.store.put_blob(payload)
+        referenced = self.store.propose_refs(self.genesis, {"file": blob}, message="same")
+        self.assertEqual(first, referenced)
+        self.store.land(referenced)
+        self.assertEqual(self.store.get_blob(blob), payload)
+
+    def test_batch_storage_failure_rolls_back_prior_successes(self):
+        first = self.store.propose(self.genesis, {"good": b"one"})
+        second = self.store.propose(self.genesis, {"fail": b"two"})
+        with closing(sqlite3.connect(self.store.database, isolation_level=None)) as db:
+            db.execute("CREATE TRIGGER fail_batch BEFORE INSERT ON versions "
+                       "WHEN NEW.path='fail' BEGIN SELECT RAISE(ABORT, 'storage failure'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.land_many([first, second])
+        self.assertEqual(self.store.head(), self.genesis)
+        self.assertEqual(self.store.manifest(), {})
+        self.assertEqual(len(self.store.log()), 1)
+
     def test_damaged_proposal_is_refused(self):
         proposal = self.store.propose(self.genesis, {"file": b"good"})
         with closing(sqlite3.connect(self.store.database, isolation_level=None)) as db:

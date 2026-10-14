@@ -166,73 +166,166 @@ class Store:
         if not isinstance(author, str) or not isinstance(message, str):
             raise SeedError("author and message must be strings")
         with self._db(write=True) as db:
-            seq = self._revision(db, base)["seq"]
             writes = {}
-            expected = {path: self._at(db, path, seq) for path in read_paths}
             for path, payload in sorted(edits.items()):
                 file_path(path)
                 if payload is not None and not isinstance(payload, bytes):
                     raise SeedError("File contents must be bytes or None")
-                before = self._at(db, path, seq)
-                after = None if payload is None else object_id("blob", payload)
-                if before == after:
-                    continue
-                writes[path] = after
-                expected[path] = before
-                if payload is not None:
-                    db.execute("INSERT OR IGNORE INTO blobs VALUES (?, ?)", (after, payload))
-            if not writes:
-                raise SeedError("No effective writes; conditions-only proposals are unsupported")
-            body = canonical({"format": 1, "base": base, "expected": expected,
-                              "writes": writes, "author": author, "message": message})
-            identifier = object_id("proposal", body)
-            db.execute("INSERT OR IGNORE INTO proposals VALUES (?, ?)", (identifier, body))
-            return identifier
+                writes[path] = None if payload is None else self._put_blob(db, payload)
+            return self._freeze(db, base, writes, read_paths, author, message)
+
+    def _put_blob(self, db, payload: bytes) -> str:
+        identifier = object_id("blob", payload)
+        db.execute("INSERT OR IGNORE INTO blobs VALUES (?, ?)", (identifier, payload))
+        return identifier
+
+    def put_blob(self, payload: bytes) -> str:
+        if not isinstance(payload, bytes):
+            raise SeedError("File contents must be bytes")
+        with self._db(write=True) as db:
+            return self._put_blob(db, payload)
+
+    def get_blob(self, identifier: str) -> bytes:
+        with self._db() as db:
+            return self._blob(db, identifier)
+
+    def _verify_blob(self, db, identifier: str):
+        self._blob(db, identifier)
+
+    def _verify_blobs(self, db, identifiers):
+        for identifier in set(identifiers):
+            self._verify_blob(db, identifier)
+
+    def propose_refs(self, base: str, writes: Mapping[str, str | None], *,
+                     reads: Iterable[str] = (), author: str = "", message: str = "") -> str:
+        """Submit previously uploaded blobs without transferring their bytes again."""
+        if isinstance(reads, str):
+            raise SeedError("reads must be a collection of paths")
+        with self._db(write=True) as db:
+            for path, blob in writes.items():
+                file_path(path)
+            self._verify_blobs(db, (b for b in writes.values() if b is not None))
+            return self._freeze(db, base, writes, {file_path(p) for p in reads}, author, message)
+
+    def _freeze(self, db, base, writes, read_paths, author, message):
+        if not isinstance(author, str) or not isinstance(message, str):
+            raise SeedError("author and message must be strings")
+        seq = self._revision(db, base)["seq"]
+        expected = self._at_many(db, set(writes) | read_paths, seq)
+        writes = {p: b for p, b in writes.items() if b != expected[p]}
+        expected = {p: b for p, b in expected.items() if p in writes or p in read_paths}
+        if not writes:
+            raise SeedError("No effective writes; conditions-only proposals are unsupported")
+        body = canonical({"format": 1, "base": base, "expected": expected,
+                          "writes": writes, "author": author, "message": message})
+        identifier = object_id("proposal", body)
+        db.execute("INSERT OR IGNORE INTO proposals VALUES (?, ?)", (identifier, body))
+        return identifier
+
+    @classmethod
+    def _at_many(cls, db, paths, seq):
+        paths = sorted(paths)
+        result = dict.fromkeys(paths)
+        for start in range(0, len(paths), 400):
+            chunk = paths[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = db.execute(
+                "SELECT path, blob FROM (SELECT path, blob, "
+                "ROW_NUMBER() OVER (PARTITION BY path ORDER BY seq DESC) AS rank "
+                f"FROM versions WHERE seq<=? AND path IN ({placeholders})) latest WHERE rank=1",
+                (seq, *chunk))
+            result.update((row["path"], row["blob"]) for row in rows)
+        return result
+
+    @classmethod
+    def _current_many(cls, db, paths):
+        paths = sorted(paths)
+        result = dict.fromkeys(paths)
+        for start in range(0, len(paths), 400):
+            chunk = paths[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = db.execute(f"SELECT path, blob FROM current_files WHERE path IN ({placeholders})",
+                              chunk)
+            result.update((row["path"], row["blob"]) for row in rows)
+        return result
+
+    def _lock_head(self, db):
+        # SQLite's BEGIN IMMEDIATE already serializes publishers.
+        pass
 
     def land(self, proposal: str) -> dict:
         """Check and publish the entire proposal, or change nothing."""
         with self._db(write=True) as db:
-            body = self._proposal(db, proposal)
-            landed = db.execute("SELECT id FROM revisions WHERE proposal=?", (proposal,)).fetchone()
-            if landed:
-                return {"revision": landed[0], "status": "already-landed"}
-            parent = self._head(db)
-            differences = {}
-            for path, expected in sorted(body["expected"].items()):
-                actual = self._current(db, path)
-                if actual != expected:
-                    differences[path] = {"expected": expected, "actual": actual}
-            if differences:
-                raise Conflict(differences)
-            # Apply to CURRENT state, never replace it with the author's base tree.
-            for path in body["writes"]:
-                db.execute("DELETE FROM current_files WHERE path=?", (path,))
-            for path, blob in body["writes"].items():
-                if blob is not None:
-                    self._blob(db, blob)
-                    db.execute("INSERT INTO current_files VALUES (?, ?)", (path, blob))
-            # Validate the final namespace, allowing file -> directory changes.
-            for path, blob in body["writes"].items():
-                if blob is None:
-                    continue
-                parts = path.split("/")
-                for count in range(1, len(parts)):
-                    ancestor = "/".join(parts[:count])
-                    if self._current(db, ancestor) is not None:
-                        raise SeedError(f"File/directory collision: {ancestor} and {path}")
-                descendant = db.execute(
-                    "SELECT path FROM current_files WHERE path>=? AND path<? LIMIT 1",
-                    (path + "/", path + "0")).fetchone()
-                if descendant:
-                    raise SeedError(f"File/directory collision: {path} and {descendant[0]}")
-            revision = object_id("revision", canonical({"parent": parent, "proposal": proposal}))
-            seq = self._revision(db, parent)["seq"] + 1
-            db.execute("INSERT INTO revisions VALUES (?, ?, ?, ?)",
-                       (seq, revision, parent, proposal))
-            db.executemany("INSERT INTO versions VALUES (?, ?, ?)",
-                           [(path, seq, blob) for path, blob in body["writes"].items()])
-            db.execute("UPDATE meta SET value=? WHERE key='head'", (revision,))
-            return {"revision": revision, "status": "landed"}
+            self._lock_head(db)
+            return self._land(db, proposal)
+
+    def land_many(self, proposals: Iterable[str]) -> list[dict]:
+        proposals = list(proposals)
+        if len(proposals) > 256:
+            raise SeedError("At most 256 proposals per batch")
+        with self._db(write=True) as db:
+            self._lock_head(db)
+            results = []
+            for proposal in proposals:
+                db.execute("SAVEPOINT proposal_landing")
+                try:
+                    result = self._land(db, proposal)
+                except (Conflict, SeedError) as exc:
+                    db.execute("ROLLBACK TO SAVEPOINT proposal_landing")
+                    result = ({"status": "conflict", "paths": exc.differences}
+                              if isinstance(exc, Conflict) else
+                              {"status": "error", "message": str(exc)})
+                db.execute("RELEASE SAVEPOINT proposal_landing")
+                results.append({"proposal": proposal, **result})
+            return results
+
+    def _land(self, db, proposal):
+        body = self._proposal(db, proposal)
+        landed = db.execute("SELECT id FROM revisions WHERE proposal=?", (proposal,)).fetchone()
+        if landed:
+            return {"revision": landed[0], "status": "already-landed"}
+        parent = self._head(db)
+        differences = {}
+        current = self._current_many(db, body["expected"])
+        for path, expected in sorted(body["expected"].items()):
+            actual = current[path]
+            if actual != expected:
+                differences[path] = {"expected": expected, "actual": actual}
+        if differences:
+            raise Conflict(differences)
+        # Apply to CURRENT state, never replace it with the author's base tree.
+        present = [(path, blob) for path, blob in body["writes"].items() if blob is not None]
+        self._verify_blobs(db, (blob for _, blob in present))
+        db.executemany("DELETE FROM current_files WHERE path=?", [(p,) for p in body["writes"]])
+        if present:
+            db.executemany("INSERT INTO current_files VALUES (?, ?)", present)
+        # Validate the final namespace, allowing file -> directory changes.
+        ancestors = set()
+        for path, blob in present:
+            parts = path.split("/")
+            for count in range(1, len(parts)):
+                ancestors.add("/".join(parts[:count]))
+        for ancestor, blob in self._current_many(db, ancestors).items():
+            if blob is not None:
+                raise SeedError("File/directory collision at ancestor: " + ancestor)
+        for start in range(0, len(present), 200):
+            chunk = present[start:start + 200]
+            values = ",".join("(?,?,?)" for _ in chunk)
+            parameters = [part for path, _ in chunk for part in (path, path + "/", path + "0")]
+            descendant = db.execute(
+                f"WITH wanted(parent,first,last) AS (VALUES {values}) "
+                "SELECT wanted.parent, files.path FROM wanted JOIN current_files files "
+                "ON files.path>=wanted.first AND files.path<wanted.last LIMIT 1", parameters).fetchone()
+            if descendant:
+                raise SeedError(f"File/directory collision: {descendant[0]} and {descendant[1]}")
+        revision = object_id("revision", canonical({"parent": parent, "proposal": proposal}))
+        seq = self._revision(db, parent)["seq"] + 1
+        db.execute("INSERT INTO revisions VALUES (?, ?, ?, ?)",
+                   (seq, revision, parent, proposal))
+        db.executemany("INSERT INTO versions VALUES (?, ?, ?)",
+                       [(path, seq, blob) for path, blob in body["writes"].items()])
+        db.execute("UPDATE meta SET value=? WHERE key='head'", (revision,))
+        return {"revision": revision, "status": "landed"}
 
     def read(self, path: str, revision: str | None = None) -> bytes | None:
         file_path(path)
@@ -258,6 +351,43 @@ class Store:
     def describe(self, proposal: str) -> dict:
         with self._db() as db:
             return self._proposal(db, proposal)
+
+    def snapshot(self, paths: Iterable[str], revision: str | None = None) -> dict:
+        paths = {file_path(p) for p in paths}
+        with self._db() as db:
+            revision = revision or self._head(db)
+            seq = self._revision(db, revision)["seq"]
+            return {"revision": revision, "files": self._at_many(db, paths, seq)}
+
+    def file_page(self, *, revision: str | None = None, after: str = "", limit: int = 100) -> dict:
+        if not 1 <= limit <= 1000:
+            raise SeedError("Page limit must be between 1 and 1000")
+        with self._db() as db:
+            revision = revision or self._head(db)
+            seq = self._revision(db, revision)["seq"]
+            found = {}
+            cursor = after
+            while len(found) <= limit:
+                candidates = list(db.execute("SELECT DISTINCT path FROM versions WHERE path>? "
+                                             "ORDER BY path LIMIT ?", (cursor, limit + 1)))
+                if not candidates:
+                    break
+                paths = [row["path"] for row in candidates]
+                for path, blob in self._at_many(db, paths, seq).items():
+                    if blob is not None:
+                        found[path] = blob
+                cursor = paths[-1]
+            items = list(found.items())[:limit]
+            return {"revision": revision, "files": dict(items),
+                    "next": items[-1][0] if len(found) > limit else None}
+
+    def log_page(self, *, after: int = -1, limit: int = 100) -> dict:
+        if after < -1 or not 1 <= limit <= 1000:
+            raise SeedError("Invalid history page")
+        with self._db() as db:
+            rows = [dict(row) for row in db.execute(
+                "SELECT * FROM revisions WHERE seq>? ORDER BY seq LIMIT ?", (after, limit + 1))]
+            return {"revisions": rows[:limit], "next": rows[limit-1]["seq"] if len(rows) > limit else None}
 
     def log(self) -> list[dict]:
         with self._db() as db:

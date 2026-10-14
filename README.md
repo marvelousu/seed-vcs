@@ -2,19 +2,19 @@
 
 [![Tests](https://github.com/marvelousu/seed-vcs/actions/workflows/test.yml/badge.svg)](https://github.com/marvelousu/seed-vcs/actions/workflows/test.yml)
 
-Seed is an experimental version-control kernel for applying **immutable,
-conditional change proposals** to a shared file state. It uses content-addressed
-storage and SQLite transactions, with no dependencies beyond Python's standard
-library.
+Seed is a version-control service for concurrent agents. It applies **immutable,
+conditional change proposals** to a shared file state, with a Python client,
+an authenticated HTTP API, PostgreSQL metadata and content-addressed file objects.
+The original SQLite CLI remains available using only Python's standard library.
 
 A proposal says: *if these files still contain the contents I started with,
 apply these replacements together.* Unrelated changes can land in the meantime
 without invalidating it. Changes to its write targets or declared dependencies
 cause the whole proposal to be rejected.
 
-The current implementation is a local CLI and Python API. Its interface and
-database format are experimental; it has no Git interoperability or network
-synchronization.
+Agent sessions pin a revision and automatically capture files read through the
+client API. Independent changes can land without rebuilding their proposals.
+Multiple service workers share PostgreSQL and the object volume.
 
 [Quick start](#quick-start) · [Usage](#usage) · [How it works](#how-it-works) ·
 [Current scope](#current-scope) · [Contributing](#contributing)
@@ -22,16 +22,21 @@ synchronization.
 ## Features
 
 - **Conditional writes.** Each edited path carries an expected content hash.
-- **Explicit read dependencies.** Include additional paths whose contents your
-  change relies on, even when you do not edit them.
+- **Captured read dependencies.** Agent sessions record reads at their pinned
+  revision, including missing files. Low-level APIs also accept explicit reads.
 - **Atomic landing.** File updates, history, and the head revision are published
   in one transaction, or rolled back together.
 - **Idempotent retries.** Landing an accepted proposal again returns its original
   revision without adding another history entry.
 - **Historical reads.** Retrieve previous file contents, including empty files
   and files that have since been deleted.
-- **Concurrent local writers.** Separate processes can submit proposals to the
-  same database; SQLite serializes their landing transactions.
+- **Concurrent service workers.** PostgreSQL coordinates publishers across
+  processes; each repository has its own head lock and metadata schema.
+- **Batch landing.** Accept multiple proposals in one transaction while keeping
+  a separate result and revision for each successful proposal.
+- **Repository-scoped credentials.** Restrict a bearer credential to named
+  repositories and read, write or create permissions.
+- **Bounded queries.** File and revision listings use cursor-based pages.
 
 ## Quick start
 
@@ -51,6 +56,91 @@ changes, conflicting writes, declared read dependencies, and retries. It also
 shows an accepted change that breaks a program because a dependency was not
 declared. Successful landing checks file conditions; it does not establish
 program correctness.
+
+## Run the service
+
+Install the service and create a credential for a repository:
+
+```sh
+python -m pip install -r requirements-server.txt
+python -m pip install --no-deps -e .
+seed-server token --repo demo
+seed-server serve
+```
+
+The `token` command prints the bearer credential once and adds its SHA-256
+digest to `.seed/credentials.json`. Keep the credential in your secret manager;
+the service reads only the digest file. Restart workers after updating grants.
+The default listener is `127.0.0.1:7331`. Without `SEED_DATABASE_URL`, repositories
+use SQLite files under `.seed/repos`.
+
+For PostgreSQL, supply `SEED_DATABASE_URL` through your secret manager or process
+configuration, then start multiple workers:
+
+```sh
+seed-server serve --workers 4
+```
+
+The PostgreSQL account must be able to create schemas in the selected database.
+Workers use PostgreSQL for metadata and `.seed/objects` for file bytes. All
+workers and hosts serving the same repositories must share that object volume.
+Serve remote connections through an HTTPS reverse proxy; remote HTTP is rejected
+by the client unless explicitly enabled.
+
+| Configuration | Default | Purpose |
+| --- | --- | --- |
+| `SEED_DATA` | `.seed` | Object directory and local SQLite repositories. |
+| `SEED_AUTH_FILE` | `$SEED_DATA/credentials.json` | Repository grants and credential digests. |
+| `SEED_DATABASE_URL` | unset | PostgreSQL connection string; unset selects SQLite. |
+| `SEED_POOL_SIZE` | `16` | Maximum PostgreSQL connections per worker. |
+
+Requests are limited to 8 MiB, proposals to 1,000 write paths and 1,000 read
+paths, landing batches to 256 proposals, and listing pages to 1,000 items.
+The server also limits concurrent connections and queued database acquisitions.
+
+### Agent client
+
+The client uses Python's standard library. Pass your credential from the
+environment populated by your secret manager:
+
+```python
+import os
+from seed_client import Client
+
+client = Client("http://127.0.0.1:7331", "demo", os.environ["SEED_TOKEN"])
+client.create()  # Idempotent repository creation; requires create permission.
+
+task = client.begin()
+previous = task.read("greeting.txt")  # Read condition is captured automatically.
+task.write("greeting.txt", b"Hello from an agent!\n")
+proposal = task.propose(author="agent-1", message="Update greeting")
+print(client.land(proposal))
+```
+
+`task.read()` always reads the pinned base revision. Capture covers this API,
+not arbitrary editor or shell reads. An absent file is captured as an absence
+condition. `task.write(path, None)` proposes deletion.
+
+`Client.land_many(ids)` returns one result per proposal. Conflicts and namespace
+errors do not undo other successful proposals; a database failure rolls back
+the whole batch. HTTP 409 reports changed conditions. Temporary connection
+errors and HTTP 429/503 are retried up to three times. Replaying a successful
+landing returns `already-landed` and the original revision.
+
+### Containers
+
+The included Compose configuration starts PostgreSQL and four service workers.
+Create `.seed/credentials.json` with the token command first, supply
+`POSTGRES_PASSWORD` through your secret manager, and run:
+
+```sh
+docker compose up --build -d
+```
+
+The port binds to loopback. Metadata and objects use persistent volumes. The
+application runs as a non-root user. `/healthz` checks the process and `/readyz`
+checks database availability. Back up PostgreSQL and its referenced objects
+together. Uploaded objects are retained; the service does not delete them.
 
 ## Usage
 
@@ -177,15 +267,23 @@ including deletion records. Landing records only the edited paths rather than
 copying a full repository snapshot. Historical reads use those version records
 to reconstruct file state at a revision.
 
-## Current scope
+## Storage and behavior
 
-Seed is a proof of the submission and landing model. It currently handles file
-bytes in one local database. Working-tree checkout, text merging, branches,
-remotes, permissions, and Git adapters are outside the implemented scope.
+Both storage backends use the same proposal and revision identities and landing
+rules. SQLite stores file bytes in its database. PostgreSQL stores blob IDs and
+sizes while the object volume holds the immutable bytes; reads verify their
+content hashes. Proposal creation and uploads do not take the repository head
+lock. Landing locks that repository's head, checks conditions and publishes the
+revision. Batch landing amortizes lock acquisition and durable commit overhead.
+
+[Architecture](docs/architecture.md) describes the protocol and transaction
+boundaries. Working-tree checkout, line-based merging and Git adapters are not
+part of this API.
 
 The following details matter when evaluating it:
 
-- **Dependencies are explicit and file-based.** Undeclared dependencies, new
+- **Dependencies are file-based.** Reads through an agent session are captured;
+  other dependencies must be declared explicitly. Undeclared dependencies, new
   entries in a directory listing, and external state are not tracked. Test and
   review the combined program separately.
 - **Conflicts are conservative.** Different edits to the same file conflict,
@@ -197,9 +295,10 @@ The following details matter when evaluating it:
 - **Paths are logical names.** Paths are case-sensitive, relative POSIX paths.
   A file named `pkg` cannot coexist with `pkg/config`. File modes, symlinks,
   submodules, and filesystem-specific export rules are not represented.
-- **The storage model is local.** SQLite allows one writer at a time. Distributed
-  scaling, power-loss recovery, and long-term production durability have not
-  been evaluated. Use SQLite's backup API to obtain a consistent live backup;
+- **Publishers have a single ordered head per repository.** PostgreSQL readers
+  use repeatable snapshots; publishers serialize on that head. Separate
+  repositories proceed independently. SQLite allows one writer per database.
+  Use SQLite's backup API to obtain a consistent live backup;
   copying only the database file can miss pending WAL contents.
 
 Author metadata is self-reported. Content hashes identify bytes; they do not
@@ -213,6 +312,38 @@ Run the behavioral suite and demo from the repository directory:
 python -m unittest -v test_seed.py
 python demo.py
 ```
+
+Install service test dependencies and run the HTTP contracts:
+
+```sh
+python -m pip install httpx==0.28.1
+python -m unittest -v test_service.ServiceTests
+```
+
+Set `SEED_TEST_DATABASE_URL` to a **dedicated test database** and run
+`python -m unittest -v test_service.PostgresServiceTests` to exercise the same
+HTTP contracts on PostgreSQL. Tests create and remove their own random schemas.
+CI runs SQLite/core and service tests on Windows and Linux, PostgreSQL contracts
+on Linux, and builds the container image.
+
+### Load measurement
+
+Use an empty repository with an authorized credential to measure the real HTTP
+service. Load an initial repository, submit independent changes from concurrent
+clients, then verify all file paths and revision sequence numbers:
+
+```sh
+seed-benchmark --repo bench --files 100000 --proposals 1000 --clients 64 --batch 8 --output result.json
+```
+
+The command reads `SEED_TOKEN`. Results include completed proposals, throughput,
+batch latency percentiles, failures and the client environment. It measures
+proposal creation and landing over HTTP, including blob uploads. Initial
+repository loading and final verification are timed separately from submissions.
+
+A [recorded run](docs/benchmark.md) used 100,000 initial paths, four HTTP workers
+and 64 concurrent clients: 1,000 proposals landed in 18.41 seconds with no errors.
+The report includes the payload sizes, initial load time and latency percentiles.
 
 The suite covers independent proposals, rejected writes with no partial
 publication, declared read conditions, idempotent retries, historical reads,
