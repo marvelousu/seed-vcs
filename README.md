@@ -1,152 +1,252 @@
-# Seed — 条件付き変更パッケージの実験
-
-Small, content-addressed version-control prototype with conditional, atomic change packages.
-Python standard library only. Experimental. MIT licensed.
+# Seed
 
 [![Tests](https://github.com/marvelousu/seed-vcs/actions/workflows/test.yml/badge.svg)](https://github.com/marvelousu/seed-vcs/actions/workflows/test.yml)
 
-「そのファイルがまだこの内容なら、これに置き換えていい」で共同開発を組み立てる。
-Python 3.12 の標準ライブラリだけで動く、小さなバージョン管理の核です。
+Seed is an experimental version-control kernel for applying **immutable,
+conditional change proposals** to a shared file state. It uses content-addressed
+storage and SQLite transactions, with no dependencies beyond Python's standard
+library.
 
-## まず試す
+A proposal says: *if these files still contain the contents I started with,
+apply these replacements together.* Unrelated changes can land in the meantime
+without invalidating it. Changes to its write targets or declared dependencies
+cause the whole proposal to be rejected.
 
-Python 3.12以上が必要です。追加パッケージのインストールは不要です。
+The current implementation is a local CLI and Python API. Its interface and
+database format are experimental; it has no Git interoperability or network
+synchronization.
+
+[Quick start](#quick-start) · [Usage](#usage) · [How it works](#how-it-works) ·
+[Current scope](#current-scope) · [Contributing](#contributing)
+
+## Features
+
+- **Conditional writes.** Each edited path carries an expected content hash.
+- **Explicit read dependencies.** Include additional paths whose contents your
+  change relies on, even when you do not edit them.
+- **Atomic landing.** File updates, history, and the head revision are published
+  in one transaction, or rolled back together.
+- **Idempotent retries.** Landing an accepted proposal again returns its original
+  revision without adding another history entry.
+- **Historical reads.** Retrieve previous file contents, including empty files
+  and files that have since been deleted.
+- **Concurrent local writers.** Separate processes can submit proposals to the
+  same database; SQLite serializes their landing transactions.
+
+## Quick start
+
+Requires **Python 3.12 or later**. Clone the repository and run the demonstration:
 
 ```sh
 git clone https://github.com/marvelousu/seed-vcs.git
 cd seed-vcs
 python demo.py
-python -m unittest -v test_seed.py
 ```
 
-デモは独立変更の取り込み、同じファイルの競合、参照先の変化、未申告の依存で実行が壊れる例、
-同じ提出の再試行を順に実行します。DBは `artifacts/tmp` の専用一時ディレクトリに作成し、終了時に削除します。
+On systems where Python is exposed as `python3`, use that command instead.
+There is no package installation or build step.
 
-## Gitが強い理由と、Scionが変えた前提
+The demo creates an isolated temporary database and exercises independent
+changes, conflicting writes, declared read dependencies, and retries. It also
+shows an accepted change that breaks a program because a dependency was not
+declared. Successful landing checks file conditions; it does not establish
+program correctness.
 
-Gitの核は、内容からIDを作るオブジェクトの保存、ファイル構成のスナップショット、
-親を参照するコミット、それを指す名前です。変更のない内容は共有されます。
-手元で履歴を調べ、コミットでき、中央サービスが使えない間も作業できます。
-分岐と取り込みを組み合わせれば、独立した組織や保守担当者の間でも開発を進められます。
-その核の上に、CLI・ホスティング・レビュー・CIとの接続が積み重なっています。
-新しいVCSの採用では、その周辺まで移し替える負担が生じます。
+## Usage
 
-技術の一次資料：[Gitの基本モデル](https://git-scm.com/book/en/v2/Getting-Started-What-is-Git%3F)、
-[オブジェクト](https://git-scm.com/book/en/v2/Git-Internals-Git-Objects)、
-[分散ワークフロー](https://git-scm.com/book/en/v2/Distributed-Git-Distributed-Workflows)。
+Run commands from the repository directory. `--db` selects the SQLite database
+and must appear before the subcommand; it defaults to `seed.db`.
 
-AnthropicのScionは、常時オンラインのエージェントとジョブを前提に、
-コミット・履歴検索・マージなどの仕事をサーバーへ寄せます。
-変更ファイルの記録と検索用の派生データを分け、必要なファイルだけを取得し、
-不変の内容を階層的にキャッシュする設計です。
-狙いは、巨大モノレポでクライアントが繰り返す転送と計算の削減です。
-一般用途のGit代替を目指すものとは説明されていません。
-[Anthropicの設計説明](https://www.anthropic.com/engineering/redesigning-source-control)
+### CLI
 
-Gitにも[partial clone](https://git-scm.com/docs/partial-clone)があります。
-Gitが必ず全内容をダウンロードする、ブランチが高価、独立変更を統合できない、という前提で比較しません。
+This example creates a database, submits a file, and reads it back. Use an unused
+database path: `init` refuses to overwrite an existing file.
 
-## こうすればいいのでは
+**Bash**
 
-作業者が提出する単位を、**前提条件＋置換内容**にする。
-main全体が進んだかどうかを、取り込み可否の条件にはしない。
-書き換えるファイルと、判断のために参照したファイルの内容を照合する。
-
-```text
-proposal = {
-  base: 作業を始めた履歴ID,
-  expected: { path: 前提とした内容のhash または null },
-  writes:   { path: 新しい内容のhash または null }
-}
-
-land(proposal):
-  トランザクション開始
-  すでに取り込み済みなら、その結果を返す
-  expected の全パスについて current[path] == expected[path] を照合
-  全部一致したら、現在の状態へ writes を一括適用
-  ファイルとディレクトリの名前衝突を確認
-  親＝現在のHEAD、提案＝proposal ID の履歴を追加
-  HEADを更新してコミット
-  途中で失敗したら、すべてロールバック
+```bash
+python seed.py --db example.db init
+python -c "from pathlib import Path; Path('payload.txt').write_bytes(b'Hello, Seed!\n')"
+base=$(python seed.py --db example.db head)
+proposal=$(python seed.py --db example.db propose --base "$base" --set hello.txt=payload.txt --author alice --message "Add a greeting")
+python seed.py --db example.db show "$proposal"
+python seed.py --db example.db land "$proposal"
+python seed.py --db example.db cat hello.txt
 ```
 
-`null` は「そのパスのファイルがない」です。空ファイルのhashとは別です。
-追加・変更・削除を同じ規則で表せます。renameは削除＋追加を一つの提案にします。
-書込み先の前提は必須で、自動的にbaseから記録します。
-追加の参照先は `reads` / `--read` で明示します。
-
-たとえば同じbaseからAが `a.py`、Bが `b.py` を変更する。
-Aを取り込んでも `b.py` が前提のままなら、Bもそのまま取り込めます。
-AとBが同じファイルを変えれば、後着を拒否します。
-BがAの変更対象を参照先に申告していれば、別ファイルへの書込みでも拒否します。
-
-これは内容アドレス方式と楽観的並行制御の組合せです。
-新しいマージアルゴリズムの発明ではありません。
-Gitもrebaseやcherry-pickで独立変更を統合できます。
-実験の価値は、提出のIDを固定したまま、小さな条件付き操作として取り込めるかを確かめることです。
-Gitとの入出力アダプターは将来の採用経路の候補です。現在の形式にGit互換性はありません。
-変更のIDをコミットのIDから分ける先例もあります。
-[GerritのChange-Id](https://gerrit-review.googlesource.com/Documentation/user-changeid.html)は、
-rebaseやcherry-pick後もレビューとの関連を保つために使われています。
-
-## 動かす
-
-PowerShellでCLIを使って独自のファイルを扱う例です。`example.db` が既にある場合、initは上書きしません。
+**PowerShell**
 
 ```powershell
 python seed.py --db example.db init
+python -c "from pathlib import Path; Path('payload.txt').write_bytes(b'Hello, Seed!\n')"
 $base = python seed.py --db example.db head
-$change = python seed.py --db example.db propose --base $base --set hello.txt=README.md --author human --message hello
-python seed.py --db example.db show $change
-python seed.py --db example.db land $change
-python seed.py --db example.db ls
+$proposal = python seed.py --db example.db propose --base $base --set hello.txt=payload.txt --author alice --message "Add a greeting"
+python seed.py --db example.db show $proposal
+python seed.py --db example.db land $proposal
 python seed.py --db example.db cat hello.txt
-python seed.py --db example.db log
 ```
 
-`cat` / `ls` に `--rev <履歴ID>` を付けると過去の状態を取得できます。
-`--delete <パス>` が削除、`--read <パス>` が追加の前提です。
-`--set` の右辺は手元のファイル、左辺はリポジトリ内の論理パスです。
-同じ左辺の重複は拒否します。取り込み成功は終了コード0、条件競合は2、その他のエラーは1です。
+The final command prints `Hello, Seed!`. Creating a proposal does not update the
+current file state; `land` does.
 
-正本は一つのSQLite DBです。内容は種類付きSHA-256で識別し、提案はcanonical JSONで保存します。
-現在のパス表と、変更したパスだけの履歴表を持ちます。
-通常の着地で全リポジトリのスナップショットをコピーしません。
-履歴IDは親と提案IDから作ります。独立変更を逆順に取り込んだ場合、最終ファイル状態は同じでも履歴IDは異なります。
+`--set REPO_PATH=LOCAL_FILE` reads bytes from a local file and stores them under a
+logical repository path. Repeat `--set` to submit several files together. Use
+`--delete REPO_PATH` for deletions and `--read REPO_PATH` for additional read
+conditions. A rename is a deletion and an addition in the same proposal.
 
-## 保証する範囲
+Read conditions are captured from `--base`. Read dependencies from that revision
+when preparing a change; listing a path with `--read` does not automatically
+observe files read by an editor or another process.
 
-- 取り込み時に、申告済みの各ファイル内容が前提と一致すること。
-- 一つの提案の書込み・履歴・HEADが一括で反映されること。
-- 再提出で同じ提案を二度取り込まないこと。
-- 別プロセスの着地をSQLiteのトランザクションで直列化し、変更を失わないこと。
-- 過去の内容を、削除の記録と空ファイルを区別して取得できること。
+### Command reference
 
-参照先は自動捕捉しません。未申告の依存、ディレクトリ列挙に後から増えたファイル、
-外部サービス、実行環境、プログラムの意味は照合の対象外です。
-取り込み可否はCI成功やレビュー承認を表しません。
-動作の確認は、実際にリリースする版に対するテストやレビューで別途行う必要があります。
+| Command | Purpose |
+| --- | --- |
+| `init` | Create an empty database and its initial revision. |
+| `head` | Print the current revision ID. |
+| `propose --base REV --set PATH=FILE` | Store a proposal; print its ID. |
+| `show PROPOSAL` | Print a proposal's conditions, writes, and metadata as JSON. |
+| `land PROPOSAL` | Apply the proposal or report a conflict. |
+| `ls [--rev REV]` | Print a JSON map of paths to content IDs. |
+| `cat PATH [--rev REV]` | Write the file's raw bytes to standard output. |
+| `log` | Print accepted revisions in chronological order as JSON. |
 
-同じファイルの異なる行への変更も保守的に競合として扱います。
-内容がA→B→Aと戻った場合は条件一致です。途中で変更されなかったという保証ではありません。
-no-op編集は書込みと暗黙条件から除去します。条件として残したいパスは明示的にreadsへ入れます。
-実効書込みのない提案は拒否します。
+`land` reports `landed` or `already-landed` with the resulting revision ID.
+Conditions that no longer match are reported as JSON on standard error, with
+the expected and actual content IDs for each conflicting path.
 
-論理パスは大小文字を区別する相対POSIX形式です。ファイル `pkg` と `pkg/config` は共存させません。
-ファイル内容だけを扱い、実行属性・symlink・submodule・Windowsへ書き出せる名前の制約は扱いません。
-作業ディレクトリへのcheckout、ネットワーク同期、認証、レビュー基盤もありません。
-作者名は自己申告のメタデータです。内容hashは本人確認や承認を証明しません。
+| Exit code | Meaning |
+| --- | --- |
+| `0` | The command succeeded. |
+| `1` | A storage, input, or namespace error occurred. |
+| `2` | Proposal conditions conflicted, or command-line parsing failed. |
 
-SQLiteのwriterは一つです。lock-freeでも、Scion規模の水平分散でもありません。
-大規模性能、プロセス強制終了・停電からの復旧、長期運用の耐久性は未検証です。
-バックアップにはSQLiteのbackup API等で一貫したコピーを取る必要があります。
-書込み中のDBファイルだけをコピーする方法はWALの内容を取りこぼす可能性があります。
-これは設計を評価するための試作です。
+### Python API
 
-## 検証とライセンス
+The same operations are available through `Store` in [seed.py](seed.py):
 
-22件のテストで独立変更、競合時の全件拒否、明示的な参照条件、複数プロセスによる同時取り込み、
-再提出、過去の削除と再作成、途中の保存失敗によるロールバックを確認します。
-GitHub ActionsでWindowsとLinuxのPython 3.12を使い、テストとデモを実行します。
+```python
+from seed import Store
 
-[MIT License](LICENSE)。
+store = Store.create("api-example.db")
+base = store.head()
+
+first = store.propose(base, {"a.txt": b"A\n"}, author="agent-a")
+second = store.propose(base, {"b.txt": b"B\n"}, author="agent-b")
+
+store.land(first)
+store.land(second)  # Still valid: b.txt has not changed since base.
+
+assert store.read("a.txt") == b"A\n"
+assert store.read("b.txt") == b"B\n"
+assert store.read("a.txt", base) is None
+```
+
+Use `Store("existing.db")` to open a database. `propose` accepts a mapping of
+paths to `bytes` or `None`, with `None` representing deletion. Its `reads`
+argument declares additional dependency paths. `land` raises `Conflict` when
+conditions differ; `Conflict.differences` contains the conflicting paths.
+
+## How it works
+
+Seed combines content-addressed objects with optimistic concurrency control.
+Its model has three parts:
+
+| Object | Contents |
+| --- | --- |
+| Blob | Immutable file bytes, identified by a type-prefixed SHA-256 hash. |
+| Proposal | A base revision, expected file hashes, desired replacements, and author/message metadata, encoded as canonical JSON. |
+| Revision | The previous head and the accepted proposal ID. |
+
+Write conditions are inferred from the proposal's base revision. Declared read
+conditions are added to the same set. `null` means the file is absent, which is
+different from the hash of an empty file.
+
+Landing takes a SQLite write transaction, checks for a previous acceptance,
+compares all conditions against the current file state, and applies all writes.
+It validates the resulting file namespace, records the revision and per-path
+history, then advances the head. Any failure rolls back the transaction.
+
+The proposal remains unchanged when the head advances. The new revision's
+parent is the actual head at landing time, rather than the proposal's original
+base. Two independent proposals can produce the same final file state in either
+order, while producing different revision IDs and history.
+
+The database maintains a current path table and per-path version records,
+including deletion records. Landing records only the edited paths rather than
+copying a full repository snapshot. Historical reads use those version records
+to reconstruct file state at a revision.
+
+## Current scope
+
+Seed is a proof of the submission and landing model. It currently handles file
+bytes in one local database. Working-tree checkout, text merging, branches,
+remotes, permissions, and Git adapters are outside the implemented scope.
+
+The following details matter when evaluating it:
+
+- **Dependencies are explicit and file-based.** Undeclared dependencies, new
+  entries in a directory listing, and external state are not tracked. Test and
+  review the combined program separately.
+- **Conflicts are conservative.** Different edits to the same file conflict,
+  including edits to unrelated lines. Conditions compare current contents; a
+  file that changed from A to B and back to A matches an A condition.
+- **No-op writes are omitted.** Their implicit conditions are omitted too. Use
+  `reads` to retain a condition on such a path. Proposals with no effective
+  writes are rejected.
+- **Paths are logical names.** Paths are case-sensitive, relative POSIX paths.
+  A file named `pkg` cannot coexist with `pkg/config`. File modes, symlinks,
+  submodules, and filesystem-specific export rules are not represented.
+- **The storage model is local.** SQLite allows one writer at a time. Distributed
+  scaling, power-loss recovery, and long-term production durability have not
+  been evaluated. Use SQLite's backup API to obtain a consistent live backup;
+  copying only the database file can miss pending WAL contents.
+
+Author metadata is self-reported. Content hashes identify bytes; they do not
+authenticate a contributor or represent a review approval.
+
+## Development
+
+Run the behavioral suite and demo from the repository directory:
+
+```sh
+python -m unittest -v test_seed.py
+python demo.py
+```
+
+The suite covers independent proposals, rejected writes with no partial
+publication, declared read conditions, idempotent retries, historical reads,
+namespace collisions, storage-failure rollback, and multiple writer processes.
+It also tests the limits of undeclared dependencies and directory listings.
+
+[GitHub Actions](https://github.com/marvelousu/seed-vcs/actions/workflows/test.yml)
+runs the suite and demo on Ubuntu and Windows with Python 3.12. Tests and the
+demo use temporary databases under `artifacts/tmp` and clean them up on exit.
+
+## Contributing
+
+Bug reports and focused pull requests are welcome. For a bug report, include
+the Python version, operating system, a minimal sequence of commands, and the
+expected and actual result. Use small, synthetic file contents for reproductions
+rather than uploading a database containing private code.
+
+For changes to landing or history behavior, include a regression test and
+describe any effects on existing databases or proposal identity. Please keep
+the core dependency-free and run the commands in [Development](#development)
+before submitting a pull request.
+
+## Related work
+
+Seed uses established ideas from content-addressed storage and optimistic
+concurrency control. Background reading:
+
+- [Git's object model](https://git-scm.com/book/en/v2/Git-Internals-Git-Objects)
+  explains content-addressed blobs, trees, and commits.
+- [Anthropic's Scion design](https://www.anthropic.com/engineering/redesigning-source-control)
+  describes source-control workloads at agent scale and motivated this experiment.
+- [Gerrit's Change-Ids](https://gerrit-review.googlesource.com/Documentation/user-changeid.html)
+  provide another example of change identity separated from commit identity.
+
+## License
+
+Seed is released under the [MIT License](LICENSE).
