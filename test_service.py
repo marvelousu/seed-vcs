@@ -54,6 +54,9 @@ class ServiceTests(unittest.TestCase):
         self.other = "test_" + secrets.token_hex(8)
         self.token = secrets.token_urlsafe(32)
         self.reader = secrets.token_urlsafe(32)
+        self.validator = secrets.token_urlsafe(32)
+        self.operator = secrets.token_urlsafe(32)
+        self.write_only = secrets.token_urlsafe(32)
         auth = Auth.from_entries(
             [
                 {
@@ -66,6 +69,12 @@ class ServiceTests(unittest.TestCase):
                     "repositories": [self.repo],
                     "permissions": ["read"],
                 },
+                {"sha256": hashlib.sha256(self.write_only.encode()).hexdigest(),
+                 "repositories": [self.repo], "permissions": ["write"]},
+                {"sha256": hashlib.sha256(self.validator.encode()).hexdigest(),
+                 "repositories": [self.repo], "permissions": ["read", "validate"]},
+                {"sha256": hashlib.sha256(self.operator.encode()).hexdigest(),
+                 "repositories": [self.repo], "permissions": ["read", "promote"]},
             ]
         )
         self.app = create_app(root=self.root, auth=auth, dsn=self.dsn)
@@ -116,6 +125,93 @@ class ServiceTests(unittest.TestCase):
         self.commit({"config": b"custom"})
         with self.assertRaises(Conflict):
             self.client.land(proposal)
+
+    def test_working_view_tracks_membership_and_outside_changes(self):
+        self.commit({"items/a": b"10", "docs/note": b"old"})
+        session = self.client.begin()
+        self.assertEqual(session.files("items"), ["items/a"])
+        session.write("items/local", b"5")
+        self.assertEqual(session.read("items/local"), b"5")
+        self.assertEqual(session.files("items/"), ["items/a", "items/local"])
+        self.commit({"docs/note": b"new"})
+        proposal = session.propose()
+        self.assertEqual(self.client.land(proposal)["status"], "landed")
+
+        stale = self.client.begin()
+        stale.files("items/")
+        stale.write("total", b"15")
+        proposal = stale.propose()
+        self.commit({"items/remote": b"20"})
+        with self.assertRaises(Conflict) as failure:
+            self.client.land(proposal)
+        self.assertEqual(failure.exception.head, self.client.head())
+        self.assertTrue(any(value.get("kind") == "membership"
+                            for value in failure.exception.differences.values()))
+        self.assertIsNone(self.client.read("total"))
+
+    def test_search_catches_new_matches_even_when_results_were_empty(self):
+        self.commit({"src/code": b"nothing here"})
+        task = self.client.begin()
+        self.assertEqual(task.search("TODO", "src/")["matches"], [])
+        task.write("report", b"none")
+        proposal = task.propose()
+        self.commit({"src/new": b"TODO fix"})
+        with self.assertRaises(Conflict):
+            self.client.land(proposal)
+        self.assertIsNone(self.client.read("report"))
+
+    def test_status_and_rework_lineage_survive_successful_retry(self):
+        self.commit({"price": b"700"})
+        first = self.client.begin()
+        first.read("price")
+        first.write("total", b"770")
+        proposal = first.propose()
+        self.assertEqual(self.client.status(proposal)["status"], "pending")
+        self.commit({"price": b"800"})
+        with self.assertRaises(Conflict):
+            self.client.land(proposal)
+        retry = self.client.begin()
+        price = int(retry.read("price"))
+        retry.write("total", str(price * 110 // 100).encode())
+        replacement = retry.propose(supersedes=proposal)
+        self.assertNotEqual(replacement, proposal)
+        self.assertEqual(self.client.describe(replacement)["supersedes"], proposal)
+        result = self.client.land(replacement)
+        self.assertEqual(self.client.status(replacement)["revision"], result["revision"])
+        self.assertEqual(self.client.land(replacement)["status"], "already-landed")
+        self.assertEqual(self.client.read("total"), b"880")
+
+    def test_range_endpoints_validate_scope_and_permissions(self):
+        headers = {"Authorization": "Bearer " + self.token}
+        endpoint = f"/v1/repos/{self.repo}/range"
+        self.assertEqual(self.http.get(endpoint).status_code, 401)
+        for query in ({"prefix": "../escape"}, {"kind": "unknown"}):
+            self.assertEqual(self.http.get(endpoint, params=query,
+                                           headers=headers).status_code, 422)
+        self.assertEqual(self.http.get(endpoint, headers=headers).status_code, 200)
+
+    def test_unicode_range_and_legacy_writer_guard_after_provider_reopen(self):
+        from seed import V2_WRITER_GUARD
+
+        base = self.commit({"資料/要約": b"original", "資料別/要約": b"outside"})
+        task = self.client.begin()
+        self.assertEqual(task.files("資料/"), ["資料/要約"])
+        task.write("result", b"derived")
+        proposal = task.propose()
+        store = self.app.state.provider.repository(self.repo)
+        body = self.client.describe(proposal)
+        with store._db() as db:
+            # The old writer would compare this invalid-for-a-file expected
+            # value and reject instead of ignoring format-2 dependencies.
+            self.assertIsNone(store._current_many(db, body["expected"])[V2_WRITER_GUARD])
+        self.assertEqual(body["expected"][V2_WRITER_GUARD], {"requires": 2})
+        self.app.state.provider.stores.pop(self.repo)
+        self.assertEqual(self.client.create()["revision"], base)
+        self.commit({"資料/追加": b"new"})
+        with self.assertRaises(Conflict):
+            self.client.land(proposal)
+        self.assertEqual(self.client.range_snapshot("資料/", revision=base)["paths"],
+                         ["資料/要約"])
 
     def test_batch_isolates_conflict_and_namespace_failure(self):
         base = self.commit({"a": b"0", "pkg": b"file"})
@@ -313,6 +409,21 @@ class ServiceTests(unittest.TestCase):
 )
 class PostgresServiceTests(ServiceTests):
     dsn = os.environ.get("SEED_TEST_DATABASE_URL", "")
+
+    def test_same_length_corruption_is_rejected_before_proposal_or_landing(self):
+        head = self.client.head()
+        blob = self.client.upload(b"good")
+        proposal = self.client.propose(head, {"value": b"good"})
+        store = self.app.state.provider.repository(self.repo)
+        store.objects.path(blob).write_bytes(b"evil")
+        with self.assertRaisesRegex(SeedError, "Damaged blob"):
+            self.client.land(proposal)
+        self.assertEqual(self.client.head(), head)
+        self.assertEqual(self.client.status(proposal)["status"], "pending")
+        with self.assertRaisesRegex(SeedError, "Damaged blob"):
+            self.client._request("POST", "/proposals", {
+                "base": head, "writes": {"other": blob}, "reads": []})
+        self.assertEqual(self.client.head(), head)
 
 
 if __name__ == "__main__":

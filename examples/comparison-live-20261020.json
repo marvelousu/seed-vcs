@@ -1,0 +1,347 @@
+{
+  "format": "seed-agent-comparison-trace/1",
+  "trace_id": "live-coding-agent-20261020",
+  "recording": {
+    "kind": "real-agent-client",
+    "label": "Sanitized transcription: coding agent used Python Client/Session over FastAPI TestClient HTTP transport",
+    "recorded_at": "2026-10-20"
+  },
+  "workloads": [
+    {
+      "id": "independent-pricing",
+      "group": "independent-edit",
+      "initial": {
+        "src/pricing.py": {
+          "encoding": "utf-8",
+          "data": "def total(price):\n    return round(price * 1.1)\n"
+        },
+        "tests/test_pricing.py": {
+          "encoding": "utf-8",
+          "data": "import unittest\nfrom src.pricing import total\n\nclass PricingTests(unittest.TestCase):\n    def test_integer_rounding(self): self.assertEqual(total(699), 768)\n    def test_negative_rejected(self):\n        with self.assertRaises(ValueError): total(-1)\n"
+        },
+        "docs/note.md": {
+          "encoding": "utf-8",
+          "data": "initial note\n"
+        }
+      },
+      "background": {
+        "docs/note.md": {
+          "encoding": "utf-8",
+          "data": "concurrent documentation clarification\n"
+        }
+      },
+      "agent": {
+        "actions": [
+          {
+            "op": "read",
+            "elapsed_ms": 6,
+            "path": "src/pricing.py",
+            "bytes": 48
+          },
+          {
+            "op": "read",
+            "elapsed_ms": 467,
+            "path": "tests/test_pricing.py",
+            "bytes": 249
+          },
+          {
+            "op": "write",
+            "elapsed_ms": 0,
+            "path": "src/pricing.py",
+            "bytes": 121
+          },
+          {
+            "op": "test",
+            "command": [
+              "python",
+              "-m",
+              "unittest",
+              "discover",
+              "-s",
+              "tests",
+              "-v"
+            ],
+            "returncode": 0,
+            "elapsed_ms": 1848,
+            "stdout": "",
+            "stderr": "test_integer_rounding (test_pricing.PricingTests.test_integer_rounding) ... ok\ntest_negative_rejected (test_pricing.PricingTests.test_negative_rejected) ... ok\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK\n"
+          },
+          {
+            "op": "propose",
+            "elapsed_ms": 5547,
+            "proposal": "f2cc155a21d71c3b6a271a23e43e8b754e6920d8a15a4b08de094c9982a5761b"
+          },
+          {
+            "op": "land",
+            "elapsed_ms": 2223,
+            "status": "landed"
+          }
+        ],
+        "proposal": {
+          "id": "f2cc155a21d71c3b6a271a23e43e8b754e6920d8a15a4b08de094c9982a5761b",
+          "edits": {
+            "src/pricing.py": {
+              "encoding": "utf-8",
+              "data": "def total(price):\n    if price < 0:\n        raise ValueError('price must be non-negative')\n    return price * 110 // 100\n"
+            }
+          },
+          "observed": {
+            "reads": [
+              "src/pricing.py",
+              "tests/test_pricing.py"
+            ],
+            "ranges": []
+          }
+        },
+        "rework": [],
+        "model": {
+          "input_tokens": null,
+          "output_tokens": null,
+          "cost_usd": null
+        },
+        "transport": {
+          "requests": 8,
+          "upload_bytes": 505,
+          "download_bytes": 933,
+          "request_seconds": 8.246459200512618
+        }
+      },
+      "oracle": {
+        "expected_safe": true,
+        "reason": "The concurrent documentation edit cannot affect pricing behavior."
+      }
+    },
+    {
+      "id": "shared-lines-name",
+      "group": "shared-file-disjoint-lines",
+      "initial": {
+        "src/shared.py": {
+          "encoding": "utf-8",
+          "data": "def normalize_name(value):\n    return value.strip().lower()\n\n# spacer 00\n# spacer 01\n# spacer 02\n# spacer 03\n# spacer 04\n# spacer 05\n# spacer 06\n# spacer 07\n# spacer 08\n# spacer 09\n# spacer 10\n# spacer 11\n# spacer 12\n# spacer 13\n# spacer 14\n# spacer 15\n# spacer 16\n# spacer 17\n# spacer 18\n# spacer 19\n# spacer 20\n# spacer 21\n# spacer 22\n# spacer 23\n# spacer 24\n# spacer 25\n# spacer 26\n# spacer 27\n# spacer 28\n# spacer 29\n# spacer 30\n# spacer 31\n# spacer 32\n# spacer 33\n# spacer 34\n# spacer 35\n# spacer 36\n# spacer 37\n# spacer 38\n# spacer 39\n# spacer 40\n# spacer 41\n# spacer 42\n# spacer 43\n# spacer 44\n# spacer 45\n# spacer 46\n# spacer 47\n# spacer 48\n# spacer 49\n# spacer 50\n# spacer 51\n# spacer 52\n# spacer 53\n# spacer 54\n# spacer 55\n# spacer 56\n# spacer 57\n# spacer 58\n# spacer 59\n# spacer 60\n# spacer 61\n# spacer 62\n# spacer 63\n# spacer 64\n\ndef format_status(code):\n    return f'status:{code}'\n"
+        },
+        "tests/test_shared.py": {
+          "encoding": "utf-8",
+          "data": "import unittest\nfrom src.shared import normalize_name\n\nclass SharedTests(unittest.TestCase):\n    def test_name_is_normalized(self): self.assertEqual(normalize_name('  Ada  '), 'ada')\n    def test_empty_name_rejected(self):\n        with self.assertRaises(ValueError): normalize_name('   ')\n"
+        }
+      },
+      "background": {
+        "src/shared.py": {
+          "encoding": "utf-8",
+          "data": "def normalize_name(value):\n    return value.strip().lower()\n\n# spacer 00\n# spacer 01\n# spacer 02\n# spacer 03\n# spacer 04\n# spacer 05\n# spacer 06\n# spacer 07\n# spacer 08\n# spacer 09\n# spacer 10\n# spacer 11\n# spacer 12\n# spacer 13\n# spacer 14\n# spacer 15\n# spacer 16\n# spacer 17\n# spacer 18\n# spacer 19\n# spacer 20\n# spacer 21\n# spacer 22\n# spacer 23\n# spacer 24\n# spacer 25\n# spacer 26\n# spacer 27\n# spacer 28\n# spacer 29\n# spacer 30\n# spacer 31\n# spacer 32\n# spacer 33\n# spacer 34\n# spacer 35\n# spacer 36\n# spacer 37\n# spacer 38\n# spacer 39\n# spacer 40\n# spacer 41\n# spacer 42\n# spacer 43\n# spacer 44\n# spacer 45\n# spacer 46\n# spacer 47\n# spacer 48\n# spacer 49\n# spacer 50\n# spacer 51\n# spacer 52\n# spacer 53\n# spacer 54\n# spacer 55\n# spacer 56\n# spacer 57\n# spacer 58\n# spacer 59\n# spacer 60\n# spacer 61\n# spacer 62\n# spacer 63\n# spacer 64\n\ndef format_status(code):\n    return f'STATUS:{code}'\n"
+        }
+      },
+      "agent": {
+        "actions": [
+          {
+            "op": "read",
+            "elapsed_ms": 4,
+            "path": "src/shared.py",
+            "bytes": 895
+          },
+          {
+            "op": "read",
+            "elapsed_ms": 4,
+            "path": "tests/test_shared.py",
+            "bytes": 289
+          },
+          {
+            "op": "write",
+            "elapsed_ms": 0,
+            "path": "src/shared.py",
+            "bytes": 991
+          },
+          {
+            "op": "test",
+            "command": [
+              "python",
+              "-m",
+              "unittest",
+              "discover",
+              "-s",
+              "tests",
+              "-v"
+            ],
+            "returncode": 0,
+            "elapsed_ms": 380,
+            "stdout": "",
+            "stderr": "test_empty_name_rejected (test_shared.SharedTests.test_empty_name_rejected) ... ok\ntest_name_is_normalized (test_shared.SharedTests.test_name_is_normalized) ... ok\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK\n"
+          },
+          {
+            "op": "propose",
+            "elapsed_ms": 0,
+            "proposal": "5c576a0f88be008c3c7694abc7e725f3976ac854f07acc25975350e14a7a34ff"
+          }
+        ],
+        "proposal": {
+          "id": "5c576a0f88be008c3c7694abc7e725f3976ac854f07acc25975350e14a7a34ff",
+          "edits": {
+            "src/shared.py": {
+              "encoding": "utf-8",
+              "data": "def normalize_name(value):\n    normalized = value.strip().lower()\n    if not normalized:\n        raise ValueError('name is required')\n    return normalized\n\n# spacer 00\n# spacer 01\n# spacer 02\n# spacer 03\n# spacer 04\n# spacer 05\n# spacer 06\n# spacer 07\n# spacer 08\n# spacer 09\n# spacer 10\n# spacer 11\n# spacer 12\n# spacer 13\n# spacer 14\n# spacer 15\n# spacer 16\n# spacer 17\n# spacer 18\n# spacer 19\n# spacer 20\n# spacer 21\n# spacer 22\n# spacer 23\n# spacer 24\n# spacer 25\n# spacer 26\n# spacer 27\n# spacer 28\n# spacer 29\n# spacer 30\n# spacer 31\n# spacer 32\n# spacer 33\n# spacer 34\n# spacer 35\n# spacer 36\n# spacer 37\n# spacer 38\n# spacer 39\n# spacer 40\n# spacer 41\n# spacer 42\n# spacer 43\n# spacer 44\n# spacer 45\n# spacer 46\n# spacer 47\n# spacer 48\n# spacer 49\n# spacer 50\n# spacer 51\n# spacer 52\n# spacer 53\n# spacer 54\n# spacer 55\n# spacer 56\n# spacer 57\n# spacer 58\n# spacer 59\n# spacer 60\n# spacer 61\n# spacer 62\n# spacer 63\n# spacer 64\n\ndef format_status(code):\n    return f'status:{code}'\n"
+            }
+          },
+          "observed": {
+            "reads": [
+              "src/shared.py",
+              "tests/test_shared.py"
+            ],
+            "ranges": []
+          }
+        },
+        "rework": [
+          {
+            "event": "conflict",
+            "paths": [
+              "src/shared.py"
+            ],
+            "head": "140f1d4c054820c6e5e757bc316ef8c315eca112682d892de54adcbbdd9ddddc"
+          },
+          {
+            "event": "reworked",
+            "supersedes": "5c576a0f88be008c3c7694abc7e725f3976ac854f07acc25975350e14a7a34ff",
+            "proposal": "2e71261bd58b70c3a0ac39485ac41b9ca6968b0a79009d22d80e4bc0b9f62f13",
+            "status": "landed",
+            "elapsed_ms": 6956,
+            "validation": {
+              "returncode": 0,
+              "elapsed_ms": 380,
+              "stdout": "",
+              "stderr": "test_empty_name_rejected (test_shared.SharedTests.test_empty_name_rejected) ... ok\ntest_name_is_normalized (test_shared.SharedTests.test_name_is_normalized) ... ok\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK\n"
+            }
+          }
+        ],
+        "model": {
+          "input_tokens": null,
+          "output_tokens": null,
+          "cost_usd": null
+        },
+        "transport": {
+          "requests": 15,
+          "upload_bytes": 2813,
+          "download_bytes": 3548,
+          "request_seconds": 12.268125900067389
+        }
+      },
+      "oracle": {
+        "expected_safe": true,
+        "reason": "The proposed top-function change and background bottom-function change touch disjoint lines with independent behavior."
+      }
+    },
+    {
+      "id": "changed-input-quote",
+      "group": "changed-read-input",
+      "initial": {
+        "config/pricing.json": {
+          "encoding": "utf-8",
+          "data": "{\"price\": 700, \"tax_percent\": 10}\n"
+        },
+        "tests/test_quote.py": {
+          "encoding": "utf-8",
+          "data": "import json\nimport unittest\n\nclass QuoteTests(unittest.TestCase):\n    def test_quote_matches_config(self):\n        config = json.load(open('config/pricing.json', encoding='utf-8'))\n        quote = int(open('generated/quote.txt', encoding='utf-8').read())\n        self.assertEqual(quote, config['price'] * (100 + config['tax_percent']) // 100)\n"
+        }
+      },
+      "background": {
+        "config/pricing.json": {
+          "encoding": "utf-8",
+          "data": "{\"price\": 800, \"tax_percent\": 10}\n"
+        }
+      },
+      "agent": {
+        "actions": [
+          {
+            "op": "read",
+            "elapsed_ms": 4,
+            "path": "config/pricing.json",
+            "bytes": 33
+          },
+          {
+            "op": "read",
+            "elapsed_ms": 303,
+            "path": "tests/test_quote.py"
+          },
+          {
+            "op": "write",
+            "elapsed_ms": 0,
+            "path": "generated/quote.txt",
+            "bytes": 4
+          },
+          {
+            "op": "test",
+            "command": [
+              "python",
+              "-m",
+              "unittest",
+              "discover",
+              "-s",
+              "tests",
+              "-v"
+            ],
+            "returncode": 0,
+            "elapsed_ms": 589,
+            "stdout": "",
+            "stderr": "test_quote_matches_config (test_quote.QuoteTests.test_quote_matches_config) ... <workspace>\\artifacts\\comparison-live-20261020\\validation\\quote-candidate\\tests\\test_quote.py:6: ResourceWarning: unclosed file <_io.TextIOWrapper name='config/pricing.json' mode='r' encoding='utf-8'>\n  config = json.load(open('config/pricing.json', encoding='utf-8'))\nResourceWarning: Enable tracemalloc to get the object allocation traceback\n<workspace>\\artifacts\\comparison-live-20261020\\validation\\quote-candidate\\tests\\test_quote.py:7: ResourceWarning: unclosed file <_io.TextIOWrapper name='generated/quote.txt' mode='r' encoding='utf-8'>\n  quote = int(open('generated/quote.txt', encoding='utf-8').read())\nResourceWarning: Enable tracemalloc to get the object allocation traceback\nok\n\n----------------------------------------------------------------------\nRan 1 test in 0.016s\n\nOK\n"
+          },
+          {
+            "op": "propose",
+            "elapsed_ms": 0,
+            "proposal": "4491fe2c8c16439bfff332f8021d3e032619f546810b33aea4c5825440fc2c78"
+          }
+        ],
+        "proposal": {
+          "id": "4491fe2c8c16439bfff332f8021d3e032619f546810b33aea4c5825440fc2c78",
+          "edits": {
+            "generated/quote.txt": {
+              "encoding": "utf-8",
+              "data": "770\n"
+            }
+          },
+          "observed": {
+            "reads": [
+              "config/pricing.json",
+              "tests/test_quote.py"
+            ],
+            "ranges": []
+          }
+        },
+        "rework": [
+          {
+            "event": "conflict",
+            "paths": [
+              "config/pricing.json"
+            ],
+            "head": "c162b6ed1f5f4c13edb5277e81a864da3b1bb51e29c03e95b00569d69b0a4414"
+          },
+          {
+            "event": "reworked",
+            "supersedes": "4491fe2c8c16439bfff332f8021d3e032619f546810b33aea4c5825440fc2c78",
+            "proposal": "e496550949f943d4798e023de4cfb3af0f7fdf131f3ec73043857ab502e97a85",
+            "status": "landed",
+            "generated": "880",
+            "elapsed_ms": 9790,
+            "validation": {
+              "returncode": 0,
+              "elapsed_ms": 777,
+              "stdout": "",
+              "stderr": "test_quote_matches_config (test_quote.QuoteTests.test_quote_matches_config) ... <workspace>\\artifacts\\comparison-live-20261020\\validation\\quote-reworked\\tests\\test_quote.py:6: ResourceWarning: unclosed file <_io.TextIOWrapper name='config/pricing.json' mode='r' encoding='utf-8'>\n  config = json.load(open('config/pricing.json', encoding='utf-8'))\nResourceWarning: Enable tracemalloc to get the object allocation traceback\n<workspace>\\artifacts\\comparison-live-20261020\\validation\\quote-reworked\\tests\\test_quote.py:7: ResourceWarning: unclosed file <_io.TextIOWrapper name='generated/quote.txt' mode='r' encoding='utf-8'>\n  quote = int(open('generated/quote.txt', encoding='utf-8').read())\nResourceWarning: Enable tracemalloc to get the object allocation traceback\nok\n\n----------------------------------------------------------------------\nRan 1 test in 0.021s\n\nOK\n"
+            }
+          }
+        ],
+        "model": {
+          "input_tokens": null,
+          "output_tokens": null,
+          "cost_usd": null
+        },
+        "transport": {
+          "requests": 15,
+          "upload_bytes": 855,
+          "download_bytes": 1886,
+          "request_seconds": 15.800731499446556
+        }
+      },
+      "oracle": {
+        "expected_safe": false,
+        "reason": "The generated quote is derived from the concurrently changed price input."
+      }
+    }
+  ]
+}

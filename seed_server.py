@@ -11,6 +11,7 @@ import re
 import secrets
 import sqlite3
 import threading
+from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
@@ -46,7 +47,7 @@ class Auth:
             if not repos or any(not re.fullmatch(REPOSITORY, r) for r in repos):
                 raise ValueError("Credentials must name their repositories")
             if not set(entry.get("permissions", [])).issubset(
-                {"read", "write", "create"}
+                {"read", "write", "create", "validate", "promote"}
             ):
                 raise ValueError("Invalid credential permissions")
 
@@ -102,6 +103,10 @@ class Provider:
                         ).fetchone()
                     if row is None:
                         raise HTTPException(404, "Repository not found")
+                    with store._db() as db:
+                        version = db.execute("SELECT value FROM meta WHERE key='format'").fetchone()
+                        if version is None or version[0] not in (store.FORMAT, store.FORMAT_V2):
+                            raise SeedError("Unsupported PostgreSQL repository format")
             else:
                 path = (
                     self.root
@@ -144,6 +149,11 @@ class BodyLimit:
                 if scope["method"] in {"GET", "HEAD"}
                 else "write"
             )
+            if scope["method"] == "POST" and route[2] == "/validations":
+                permission = "validate"
+            elif ((scope["method"] == "PUT" and route[2] == "/validation-policy")
+                  or (scope["method"] == "POST" and route[2] == "/promotions")):
+                permission = "promote"
             try:
                 self.auth.check(
                     headers.get(b"authorization", b"").decode("latin1"),
@@ -193,13 +203,45 @@ class BodyLimit:
         await self.app(scope, replay, send)
 
 
+class RangeCondition(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    kind: Literal["membership", "subtree"]
+    prefix: str = Field(default="", max_length=2048)
+
+
 class Proposal(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     base: str = Field(pattern=IDENTIFIER)
     writes: dict[str, str | None] = Field(min_length=1, max_length=1000)
     reads: list[str] = Field(default_factory=list, max_length=1000)
+    ranges: list[RangeCondition] = Field(default_factory=list, max_length=64)
+    supersedes: str | None = Field(default=None, pattern=IDENTIFIER)
     author: str = Field(default="", max_length=256)
     message: str = Field(default="", max_length=4096)
+
+
+class ValidationPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    configurations: list[str] = Field(min_length=1, max_length=16)
+
+
+class ValidationReport(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    kind: Literal["candidate", "revision"]
+    subject: str = Field(pattern=IDENTIFIER)
+    configuration: str = Field(pattern=IDENTIFIER)
+    environment: str = Field(pattern=IDENTIFIER)
+    passed: bool
+    returncode: int | None
+    timed_out: bool = False
+    elapsed_ms: int = Field(default=0, ge=0, le=86_400_000)
+    log_digest: str = Field(pattern=IDENTIFIER)
+    request: str = Field(min_length=1, max_length=128)
+
+
+class RevisionSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    revision: str = Field(pattern=IDENTIFIER)
 
 
 class Landing(BaseModel):
@@ -231,7 +273,7 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
         finally:
             provider.close()
 
-    app = FastAPI(title="Seed", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="Seed", version="0.4.0", lifespan=lifespan)
     app.add_middleware(BodyLimit, auth=auth)
     app.state.provider = provider
 
@@ -247,11 +289,13 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
         access("write"),
         access("create"),
     )
+    validate_access, promote_access = access("validate"), access("promote")
 
     @app.exception_handler(Conflict)
     async def conflict_handler(request, exc):
         return JSONResponse(
-            {"status": "conflict", "paths": exc.differences}, status_code=409
+            {"status": "conflict", "paths": exc.differences,
+             "head": getattr(exc, "head", None)}, status_code=409
         )
 
     @app.exception_handler(SeedError)
@@ -282,6 +326,41 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
     @app.get("/v1/repos/{repo}/head")
     def head(repo: str = Depends(read_access)):
         return {"revision": provider.repository(repo).head()}
+
+    @app.post("/v1/repos/{repo}/candidates", dependencies=[Depends(read_access)])
+    def candidate_create(body: Batch, repo: str = Depends(write_access)):
+        from seed_validation import create_candidate
+        return create_candidate(provider.repository(repo), body.proposals)
+
+    @app.get("/v1/repos/{repo}/candidates/{identifier}")
+    def candidate_read(identifier: str, repo: str = Depends(read_access)):
+        from seed_validation import candidate
+        return candidate(provider.repository(repo), identifier)
+
+    @app.post("/v1/repos/{repo}/candidates/{identifier}/publish")
+    def candidate_publish(identifier: str, repo: str = Depends(write_access)):
+        from seed_validation import publish_candidate
+        return publish_candidate(provider.repository(repo), identifier)
+
+    @app.put("/v1/repos/{repo}/validation-policy")
+    def policy_update(body: ValidationPolicy, repo: str = Depends(promote_access)):
+        from seed_validation import set_policy
+        return set_policy(provider.repository(repo), body.configurations)
+
+    @app.get("/v1/repos/{repo}/validation-state")
+    def validation_state_read(repo: str = Depends(read_access)):
+        from seed_validation import validation_state
+        return validation_state(provider.repository(repo))
+
+    @app.post("/v1/repos/{repo}/validations")
+    def validation_record(body: ValidationReport, repo: str = Depends(validate_access)):
+        from seed_validation import record_validation
+        return record_validation(provider.repository(repo), **body.model_dump())
+
+    @app.post("/v1/repos/{repo}/promotions")
+    def revision_promote(body: RevisionSelection, repo: str = Depends(promote_access)):
+        from seed_validation import promote
+        return promote(provider.repository(repo), body.revision)
 
     @app.put("/v1/repos/{repo}/blobs/{identifier}")
     async def upload(
@@ -338,6 +417,17 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
     ):
         return provider.repository(repo).log_page(after=after, limit=limit)
 
+    @app.get("/v1/repos/{repo}/range")
+    def range_snapshot(
+        prefix: str = Query(default="", max_length=2048),
+        kind: Literal["membership", "subtree"] = "membership",
+        revision: str | None = Query(default=None, pattern=IDENTIFIER),
+        repo: str = Depends(read_access),
+    ):
+        return provider.repository(repo).range_snapshot(
+            prefix=prefix, kind=kind, revision=revision
+        )
+
     @app.post("/v1/repos/{repo}/proposals")
     def propose(body: Proposal, repo: str = Depends(write_access)):
         for path in set(body.writes) | set(body.reads):
@@ -353,6 +443,8 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
             body.base,
             body.writes,
             reads=body.reads,
+            ranges=[condition.model_dump() for condition in body.ranges],
+            supersedes=body.supersedes,
             author=body.author,
             message=body.message,
         )
@@ -361,6 +453,12 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
     @app.get("/v1/repos/{repo}/proposals/{identifier}")
     def describe(identifier: str, repo: str = Depends(read_access)):
         return provider.repository(repo).describe(identifier)
+
+    @app.get("/v1/repos/{repo}/proposals/{identifier}/status")
+    def proposal_status(identifier: str, repo: str = Depends(read_access)):
+        if not re.fullmatch(IDENTIFIER, identifier):
+            raise HTTPException(422, "Invalid proposal ID")
+        return provider.repository(repo).proposal_status(identifier)
 
     @app.post("/v1/repos/{repo}/land")
     def land(body: Landing, repo: str = Depends(write_access)):
@@ -454,7 +552,7 @@ def main(argv=None):
     token.add_argument(
         "--permissions",
         nargs="+",
-        choices=["read", "write", "create"],
+        choices=["read", "write", "create", "validate", "promote"],
         default=["read", "write", "create"],
     )
     serve = commands.add_parser("serve")

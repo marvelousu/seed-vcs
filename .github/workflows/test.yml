@@ -25,13 +25,25 @@ jobs:
         with:
           python-version: '3.12'
       - name: Run behavioral tests
-        run: python -m unittest -v test_seed.py
+        run: python -m unittest -v test_seed.py test_predicates.py test_backup.BackupTests test_git.py test_comparison.py test_workflow_environment.py
       - name: Run two-agent demonstration
         run: python demo.py
       - name: Install service dependencies
         run: pip install -r requirements-server.txt httpx==0.28.1 && pip install --no-deps -e .
       - name: Run HTTP and agent session contracts
-        run: python -m unittest -v test_service.ServiceTests
+        run: python -m unittest -v test_service.ServiceTests test_session.py test_agent.py test_validation.ValidationTests
+      - name: Compare deterministic integration workflows
+        run: python workflow_benchmark.py --output artifacts/workflow-replay.json
+      - name: Replay captured coding samples across three backends
+        if: runner.os == 'Linux'
+        run: python agent_comparison.py replay --trace examples/comparison-live-20261020.json --repeats 5 --output artifacts/agent-comparison.json
+      - name: Preserve comparison measurements
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-comparison-${{ github.sha }}
+          path: artifacts/agent-comparison.json
+          if-no-files-found: error
 
   postgres:
     name: PostgreSQL / HTTP / container
@@ -61,7 +73,7 @@ jobs:
       - name: Install service dependencies
         run: pip install -r requirements-server.txt httpx==0.28.1 && pip install --no-deps -e .
       - name: Run real PostgreSQL contracts
-        run: python -m unittest -v test_service.PostgresServiceTests
+        run: python -m unittest -v test_service.PostgresServiceTests test_validation.PostgresValidationTests test_backup.PostgresBackupTests
       - name: Build service image
         run: docker build -t seed-service .
       - name: Exercise container HTTP and persistent objects

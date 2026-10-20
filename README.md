@@ -17,13 +17,21 @@ client API. Independent changes can land without rebuilding their proposals.
 Multiple service workers share PostgreSQL and the object volume.
 
 [Quick start](#quick-start) · [Usage](#usage) · [How it works](#how-it-works) ·
-[Current scope](#current-scope) · [Contributing](#contributing)
+[Storage and behavior](#storage-and-behavior) · [Contributing](#contributing)
 
 ## Features
 
 - **Conditional writes.** Each edited path carries an expected content hash.
 - **Captured read dependencies.** Agent sessions record reads at their pinned
   revision, including missing files. Low-level APIs also accept explicit reads.
+- **Working sessions.** Reads, listings and literal text searches include
+  pending edits. Listings guard membership; searches guard the scoped subtree.
+- **Restartable agent tasks.** A JSON CLI saves task state, proposals and
+  outcomes, and supports explicitly scoped command workspaces.
+- **Revision-bound validation.** Keep integrated, verified and deployable
+  revisions separate; optionally validate a combined candidate before landing.
+- **Git bridge and recovery.** Import a regular-file Git snapshot, export
+  revisions to a dedicated Git branch, and verify logical repository backups.
 - **Atomic landing.** File updates, history, and the head revision are published
   in one transaction, or rolled back together.
 - **Idempotent retries.** Landing an accepted proposal again returns its original
@@ -35,7 +43,7 @@ Multiple service workers share PostgreSQL and the object volume.
 - **Batch landing.** Accept multiple proposals in one transaction while keeping
   a separate result and revision for each successful proposal.
 - **Repository-scoped credentials.** Restrict a bearer credential to named
-  repositories and read, write or create permissions.
+  repositories and read, write, create, validate or promote permissions.
 - **Bounded queries.** File and revision listings use cursor-based pages.
 
 ## Quick start
@@ -117,9 +125,22 @@ proposal = task.propose(author="agent-1", message="Update greeting")
 print(client.land(proposal))
 ```
 
-`task.read()` always reads the pinned base revision. Capture covers this API,
-not arbitrary editor or shell reads. An absent file is captured as an absence
-condition. `task.write(path, None)` proposes deletion.
+In version 0.3, `task.read()` reads the pinned base **plus pending edits**.
+Use `task.read_base()` to read the original pinned version explicitly. An absent
+file is captured as an absence condition. `task.write(path, None)` proposes
+deletion. `task.files("src/")` records directory membership, while
+`task.search("TODO", "src/")` guards all paths and contents in that subtree,
+including files which did not match. Scopes are bounded to 10,000 files and
+proposals to 64 range conditions; oversized scopes fail rather than truncate
+their dependency conditions. Search output is bounded separately.
+
+The [agent workflow guide](docs/agent-workflow.md) covers the persistent
+`seed-agent` CLI, command workspaces, safe rework and the version 0.3 upgrade.
+
+Version 0.4 adds [validation and deployment targets](docs/validation.md),
+the [one-way Git bridge](docs/git-bridge.md), and [backup/restore](docs/backup.md).
+The [agent comparison guide](docs/agent-comparison.md) explains how captured
+coding traces are replayed against Seed and automated Git workflows.
 
 `Client.land_many(ids)` returns one result per proposal. Conflicts and namespace
 errors do not undo other successful proposals; a database failure rolls back
@@ -277,15 +298,17 @@ lock. Landing locks that repository's head, checks conditions and publishes the
 revision. Batch landing amortizes lock acquisition and durable commit overhead.
 
 [Architecture](docs/architecture.md) describes the protocol and transaction
-boundaries. Working-tree checkout, line-based merging and Git adapters are not
-part of this API.
+boundaries. The local task adapter materializes scoped regular-file workspaces;
+the core service publishes file states. The Git bridge handles explicit one-way
+snapshot import and revision export. Line-based merging and simultaneous
+two-way synchronization remain separate design work.
 
 The following details matter when evaluating it:
 
-- **Dependencies are file-based.** Reads through an agent session are captured;
-  other dependencies must be declared explicitly. Undeclared dependencies, new
-  entries in a directory listing, and external state are not tracked. Test and
-  review the combined program separately.
+- **Dependencies follow the operations used.** Session reads capture file
+  content and absence; `files` captures scoped membership; `search` captures a
+  conservative subtree condition. Arbitrary shell and external inputs need
+  explicit handling. Test and review the combined program separately.
 - **Conflicts are conservative.** Different edits to the same file conflict,
   including edits to unrelated lines. Conditions compare current contents; a
   file that changed from A to B and back to A matches an A condition.
@@ -309,7 +332,7 @@ authenticate a contributor or represent a review approval.
 Run the behavioral suite and demo from the repository directory:
 
 ```sh
-python -m unittest -v test_seed.py
+python -m unittest -v test_seed.py test_predicates.py test_backup.BackupTests test_git.py test_comparison.py test_workflow_environment.py
 python demo.py
 ```
 
@@ -317,12 +340,13 @@ Install service test dependencies and run the HTTP contracts:
 
 ```sh
 python -m pip install httpx==0.28.1
-python -m unittest -v test_service.ServiceTests
+python -m unittest -v test_service.ServiceTests test_session.py test_agent.py test_validation.ValidationTests
 ```
 
 Set `SEED_TEST_DATABASE_URL` to a **dedicated test database** and run
-`python -m unittest -v test_service.PostgresServiceTests` to exercise the same
-HTTP contracts on PostgreSQL. Tests create and remove their own random schemas.
+`python -m unittest -v test_service.PostgresServiceTests test_validation.PostgresValidationTests test_backup.PostgresBackupTests`
+to exercise the HTTP, validation and restore contracts on PostgreSQL. Tests
+create and remove their own random schemas.
 CI runs SQLite/core and service tests on Windows and Linux, PostgreSQL contracts
 on Linux, and builds the container image.
 
@@ -348,7 +372,14 @@ The report includes the payload sizes, initial load time and latency percentiles
 The suite covers independent proposals, rejected writes with no partial
 publication, declared read conditions, idempotent retries, historical reads,
 namespace collisions, storage-failure rollback, and multiple writer processes.
-It also tests the limits of undeclared dependencies and directory listings.
+It also covers scoped dependency conditions, work-view semantics, persistent
+task recovery and command workspace safety. Legacy low-level calls still
+demonstrate what happens when a dependency is not declared.
+
+For a deterministic comparison with automated Git and Git with equivalent
+dependency checks, run `python workflow_benchmark.py --output artifacts/workflow-replay.json`.
+See the [workflow guide](docs/agent-workflow.md#measure-before-extending-the-architecture)
+for what this replay measures and the real-agent measurements still needed.
 
 [GitHub Actions](https://github.com/marvelousu/seed-vcs/actions/workflows/test.yml)
 runs the suite and demo on Ubuntu and Windows with Python 3.12. Tests and the
