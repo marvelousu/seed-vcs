@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from experiments.live_agent.export_results import build_export
+from experiments.live_agent.export_results import _sanitize_text, build_export
 
 
 class ExportResultsTests(unittest.TestCase):
@@ -23,13 +23,15 @@ class ExportResultsTests(unittest.TestCase):
         path.write_text(json.dumps(value), encoding="utf-8")
 
     def test_nested_stdout_and_windows_paths_are_not_exported(self) -> None:
+        home = str(Path.home())
+        home_escaped = home.replace("\\", "\\\\")
         self._write_json(self.root / "result.json", {
             "frozen": "abc123",
-            "runs": [{"card": "clean-filter", "arm": "seed", "body": {"command": {"stdout": "C:\\Users\\maro6\\telemetry.json"}}}],
+            "runs": [{"card": "clean-filter", "arm": "seed", "body": {"command": {"stdout": f"{home}\\telemetry.json"}}}],
             "failures": [{"card": "clean-filter"}],
             "order": ["clean-filter"],
             "arms": ["seed", "git"],
-            "raw_stdout": "C:\\Users\\maro6\\secret",
+            "raw_stdout": f"{home}\\secret",
         })
         run = self.root / "runs" / "clean-filter" / "seed" / "candidate"
         self._write_json(run / "summary.json", {
@@ -49,11 +51,11 @@ class ExportResultsTests(unittest.TestCase):
             "resolved_model_matches": True,
             "prompt_sha256": "prompt",
             "evaluation": {"passed": False},
-            "nested": {"command": {"stdout": "C:\\Users\\maro6\\telemetry.json"}},
+            "nested": {"command": {"stdout": f"{home}\\telemetry.json"}},
         })
         app = self.root / "runs" / "clean-filter" / "seed" / "workspace" / "app"
         app.mkdir(parents=True)
-        app.joinpath("reviewbox.py").write_text('PATH = "C:\\\\Users\\\\maro6\\\\work"\n', encoding="utf-8")
+        app.joinpath("reviewbox.py").write_text(f'PATH = "{home_escaped}\\\\work"\n', encoding="utf-8")
         app.joinpath("__pycache__").mkdir()
         app.joinpath("__pycache__", "ignored.pyc").write_bytes(b"ignored")
         for relative in ("seed/rework-workspace/app", "seed/final-head/app", "git/agent/app", "git/repo/app", "git/rework/app"):
@@ -65,7 +67,7 @@ class ExportResultsTests(unittest.TestCase):
         archive = build_export(self.root, output, repo_root=Path.cwd())
 
         rendered = json.dumps(archive, ensure_ascii=False)
-        self.assertNotIn("C:\\Users\\maro6", rendered)
+        self.assertNotIn(home, rendered)
         self.assertNotIn("telemetry.json", rendered)
         self.assertEqual(archive["source_freeze"], "abc123")
         self.assertEqual(archive["result"]["failures"], [{"card": "clean-filter"}])
@@ -79,6 +81,13 @@ class ExportResultsTests(unittest.TestCase):
         self.assertNotEqual(exported_file["original_sha256"], exported_file["export_sha256"])
         with gzip.open(output, "rt", encoding="utf-8") as stream:
             self.assertEqual(json.load(stream), archive)
+
+    def test_windows_escaped_home_variant_is_sanitized_portably(self) -> None:
+        root = r"C:\Users\example"
+        value = r"C:\\Users\\example\\workspace"
+        sanitized = _sanitize_text(value, [(root, "<HOME>")])
+        self.assertIn("<HOME>", sanitized)
+        self.assertNotIn(r"C:\\Users\\example", sanitized)
 
     def test_gzip_output_is_reproducible(self) -> None:
         self._write_json(self.root / "result.json", {"frozen": "freeze", "runs": [], "failures": [], "order": [], "arms": []})

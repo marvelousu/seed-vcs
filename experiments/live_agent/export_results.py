@@ -178,9 +178,13 @@ def _source_records(input_root: Path, replacements: Iterable[tuple[str, str]]) -
     return records
 
 
-def _assert_public(value: Any) -> None:
+def _assert_public(value: Any, replacements: Iterable[tuple[str, str]]) -> None:
     rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
-    forbidden = ("C:\\Users\\maro6", "/Users/maro6", str(Path.home()))
+    forbidden = {
+        variant
+        for root, _marker in replacements
+        for variant in (root, root.replace("\\", "/"), root.replace("\\", "\\\\"))
+    }
     if any(item in rendered for item in forbidden):
         raise ValueError("unsanitized private path in export")
     if _SECRET.search(rendered):
@@ -209,7 +213,7 @@ def build_export(input_root: Path, output: Path, *, repo_root: Path | None = Non
         "summaries": summaries,
         "sources": _source_records(input_root, replacements),
     }
-    _assert_public(archive)
+    _assert_public(archive, replacements)
     payload = json.dumps(archive, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("wb") as stream:
