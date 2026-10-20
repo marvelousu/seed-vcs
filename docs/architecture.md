@@ -30,16 +30,42 @@ or its store API, rather than modifying its tables directly.
 ## Agent protocol
 
 1. Pin a base revision once per task.
-2. Read paths at that revision. The Python session records every requested
-   path, including absent files, as a read condition.
+2. Read a work view of that revision plus pending edits. The Python session
+   records requested paths, including absent files. Scoped listings record
+   membership; literal searches record a conservative subtree condition.
 3. Upload changed blobs and submit their IDs, paths and the captured read set.
 4. Land the immutable proposal, alone or in a batch.
 5. On conflict, start a new session at the current head and reconsider the
    affected code. A retry of an accepted proposal returns its original revision.
 
-Automatic capture covers reads through the session API. Files read by shell
-commands, directory enumeration and external services require separate handling.
+Automatic capture covers the session's read/list/search operations. Range
+conditions are derived from the pinned base and checked in the same transaction
+as file conditions. Historical range queries remain pinned even if another
+publisher advances the head while a proposal is being created. Bounded scopes
+fail above their cap rather than publishing an incomplete predicate.
+
+The local `seed-agent` adapter persists tasks, exposes JSON commands and can
+materialize an explicitly scoped regular-file workspace. Commands establish a
+conservative subtree dependency; this is not transparent process-read tracing
+or a sandbox. External services and machine state need separate handling.
 The result of landing is a condition check, not a proof that tests will pass.
+Task command results name their exact base and edited-state digest, and are not
+treated as validation of arbitrary later combinations.
+
+The task file is replaced atomically under a process-scoped OS advisory lock.
+Proposal IDs are saved before landing, so an unknown success can be recovered
+through a read-only status query. Rework creates a fresh task at the new head,
+without reusing stale edits; its proposal names the superseded proposal.
+Workspace manifests retain base blob IDs so repeated command runs replace the
+whole scoped delta, including reversions. Their dependency guard is persisted
+before command execution and restored after an interrupted first run.
+
+Version 0.3 reads format-1 data. A format-2 proposal upgrades the repository's
+format marker, which prevents old SQLite code from reopening it. A writer guard
+also makes old PostgreSQL code reject format-2 proposals rather than ignore
+their predicates. Stop all old writers before upgrading; old processes must
+not be mixed with new workers. See the upgrade instructions in
+[agent-workflow.md](agent-workflow.md).
 
 ## Access and operation
 

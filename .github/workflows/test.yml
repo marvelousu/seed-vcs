@@ -25,13 +25,15 @@ jobs:
         with:
           python-version: '3.12'
       - name: Run behavioral tests
-        run: python -m unittest -v test_seed.py
+        run: python -m unittest -v test_seed.py test_predicates.py
       - name: Run two-agent demonstration
         run: python demo.py
       - name: Install service dependencies
         run: pip install -r requirements-server.txt httpx==0.28.1 && pip install --no-deps -e .
       - name: Run HTTP and agent session contracts
-        run: python -m unittest -v test_service.ServiceTests
+        run: python -m unittest -v test_service.ServiceTests test_session.py test_agent.py
+      - name: Compare deterministic integration workflows
+        run: python workflow_benchmark.py --output artifacts/workflow-replay.json
 
   postgres:
     name: PostgreSQL / HTTP / container

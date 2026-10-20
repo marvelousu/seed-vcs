@@ -1,0 +1,2 @@
+include demo.py test_*.py
+recursive-include docs *.md
