@@ -11,6 +11,7 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -87,7 +88,11 @@ def git(root, case, conditional=False):
     repo.mkdir()
 
     def call(*args, cwd=repo, check=True):
-        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.upper().startswith("GIT_")}
+        result = subprocess.run(["git", "-c", "core.hooksPath=" + os.devnull,
+                                 "-c", "commit.gpgsign=false", *args],
+                                cwd=cwd, env=environment, capture_output=True,
                                 text=True, encoding="utf-8", check=False,
                                 timeout=30)
         if check and result.returncode:
