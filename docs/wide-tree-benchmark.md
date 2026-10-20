@@ -13,6 +13,74 @@ At batch size 1 this also means one process per accepted commit; at batch size 3
 all 31 accepted commits use one process. Startup and mark-file I/O remain in its
 reported publication time.
 
+## Recorded result
+
+The complete matrix passed on [GitHub Actions run 39369595597](https://github.com/marvelousu/seed-vcs/actions/runs/39369595597),
+using source `c4d3364fdfdfad52a0a7b8fc1279ad2c83743ea9` with a clean checkout.
+Environment: Ubuntu runner, Linux 6.17, four logical CPUs, Python 3.12.15,
+SQLite 3.45.1, Git 2.55.0. CPU model and storage hardware were not identified;
+this is one runner, not a hardware-normalized benchmark.
+
+Every measured row accepted 31 proposals and rejected the stale-input proposal.
+Both backends produced the same verified final content for every layout, with
+individual historical payloads, parent chains, and retained proposal audit data.
+The following are whole-run publication times for those 32 submissions, with
+seven measurements per cell. IQR is the interquartile range, not a confidence
+interval. Batch size includes the rejected proposal.
+
+| Layout | Files | Batch | Seed median (IQR), ms | Git median (IQR), ms | Git / Seed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| flat | 128 | 1 | 56.71 (4.93) | 155.65 (6.33) | 2.7x |
+| flat | 128 | 8 | 11.19 (3.85) | 25.76 (0.65) | 2.3x |
+| flat | 128 | 32 | 5.77 (1.06) | 15.18 (0.62) | 2.6x |
+| flat | 4,096 | 1 | 57.74 (2.25) | 386.77 (3.92) | 6.7x |
+| flat | 4,096 | 8 | 13.20 (0.93) | 111.28 (1.95) | 8.4x |
+| flat | 4,096 | 32 | 7.81 (0.31) | 78.32 (2.21) | 10.0x |
+| flat | 32,768 | 1 | 57.70 (1.68) | 2148.37 (7.11) | 37.2x |
+| flat | 32,768 | 8 | 13.83 (0.71) | 763.66 (2.19) | 55.2x |
+| flat | 32,768 | 32 | 7.54 (0.35) | 580.71 (2.36) | 77.0x |
+| sharded | 32,768 | 1 | 55.47 (3.07) | 164.01 (2.22) | 3.0x |
+| sharded | 32,768 | 8 | 13.66 (0.76) | 39.03 (0.56) | 2.9x |
+| sharded | 32,768 | 32 | 7.88 (0.21) | 25.21 (0.18) | 3.2x |
+
+At batch size 32, Git uses one importer for all 31 commits. Flat 32,768 took
+580.71 ms for Git and 7.54 ms for Seed (77.0x in this run).
+Sharding those same files reduced Git to 25.21 ms (23.0x faster than
+its flat layout), while Seed remained near 8 ms. The 128-file control has a
+smaller fixed gap; the large additional gap tracks directory layout rather
+than only importer startup. This supports the narrow wide-directory hypothesis
+for this importer and these settings, without claiming an optimal Git service.
+
+For batch size 32, the median CPU totals and complete repository sizes were:
+
+| Layout / files | Seed CPU, ms | Git CPU, ms | Seed after VACUUM, MiB | Git after gc, MiB |
+| --- | ---: | ---: | ---: | ---: |
+| flat / 128 | 4.59 | 13.95 | 0.17 | 0.08 |
+| flat / 4,096 | 5.97 | 77.29 | 2.34 | 0.39 |
+| flat / 32,768 | 6.19 | 579.42 | 18.16 | 2.68 |
+| sharded / 32,768 | 6.41 | 24.27 | 18.96 | 2.72 |
+
+**Git uses substantially less storage here.** Seed's indexed SQLite representation
+buys publication speed at a larger footprint in this fixture; Git compresses the
+similar file contents and tree history effectively. Raw logical tree-byte counts
+in the report are not compressed disk consumption or transferred bytes. Base
+preparation, setup, flush, and maintenance timings remain available in the raw
+report alongside publication time.
+
+A concrete candidate use is an agent integration service accepting many prepared
+per-asset/UI-definition updates, where each change needs its own reconstructible
+history and a flat generated namespace is retained. For a normal source tree,
+small isolated changes, or a workflow happy with a single batch commit, the
+benefit needs separate evidence. Sharding directories is a practical Git option.
+These measurements justify testing Seed in that specific workload; they do not
+establish that an independent VCS is necessary for AI development in general.
+
+The [complete raw report](measurements/wide-tree-20261020.json.gz) retains all 168
+rows and original prepared conditions as gzip-compressed JSON. Decompress it
+with Python's `gzip` module or any standard gzip tool. Its uncompressed SHA-256 is
+`531d746991a8def5b3cc86f51bfd7a761bc84257920de5b3071b299cacec4b19`. The artifact and committed archive contain
+identical JSON bytes; no slower cells were removed.
+
 ## Hypothesis and required history
 
 Seed indexes current paths and per-path history. Git commits reference tree
