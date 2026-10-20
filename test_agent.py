@@ -116,6 +116,11 @@ class AgentTests(unittest.TestCase):
         state = self.state_data()
         self.assertEqual(state["reads"], ["price.txt"])
         self.assertEqual(base64.b64decode(state["edits"]["price.txt"]), b"800\n")
+        observation = next(item for item in state["metrics"] if item["event"] == "observation")
+        self.assertEqual(observation["base"], state["base"])
+        self.assertEqual(observation["operation"], "read")
+        self.assertEqual(len(observation["response_digest"]), 64)
+        self.assertNotIn("test-token", json.dumps(observation))
 
     def test_unknown_success_is_recovered_on_next_open(self):
         self.freeze()

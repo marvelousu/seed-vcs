@@ -853,6 +853,15 @@ def execute(arguments: argparse.Namespace) -> dict[str, Any]:
         else:  # pragma: no cover - argparse keeps this unreachable
             raise SeedError("Unknown command")
 
+        if arguments.action in {"read", "list", "search"}:
+            # Tie an observation to its base and overlay without duplicating
+            # source contents or storing a potentially sensitive search query.
+            _record(state, "observation", operation=arguments.action,
+                    base=session.base, overlay=_overlay_digest(session.edits),
+                    response_digest=hashlib.sha256(
+                        json.dumps(result, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                    ).hexdigest())
+            changed = True
         # A client lives for one CLI command; preserve its aggregate transport
         # counters with this task after a successful action.
         changed = _record_transport(state, client, arguments.action) or changed
