@@ -141,6 +141,9 @@ Version 0.4 adds [validation and deployment targets](docs/validation.md),
 the [one-way Git bridge](docs/git-bridge.md), and [backup/restore](docs/backup.md).
 The [agent comparison guide](docs/agent-comparison.md) explains how captured
 coding traces are replayed against Seed and automated Git workflows.
+The [wide-directory publication experiment](docs/wide-tree-benchmark.md) tests
+local integration cost against a batched bare-Git importer, with small and
+sharded controls.
 
 `Client.land_many(ids)` returns one result per proposal. Conflicts and namespace
 errors do not undo other successful proposals; a database failure rolls back

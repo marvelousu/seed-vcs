@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 WORKDIR /app
-COPY pyproject.toml requirements-server.txt README.md LICENSE seed.py seed_server.py seed_client.py seed_postgres.py benchmark.py seed_agent.py seed_workspace.py workflow_benchmark.py seed_validation.py seed_git.py seed_backup.py agent_comparison.py ./
+COPY pyproject.toml requirements-server.txt README.md LICENSE seed.py seed_server.py seed_client.py seed_postgres.py benchmark.py seed_agent.py seed_workspace.py workflow_benchmark.py seed_validation.py seed_git.py seed_backup.py agent_comparison.py wide_tree_benchmark.py ./
 RUN pip install --no-cache-dir -r requirements-server.txt && pip install --no-cache-dir --no-deps . \
     && useradd --uid 10001 --create-home seed \
     && mkdir /data && chown seed:seed /data

@@ -24,6 +24,7 @@ seed-validate = "seed_validation:main"
 seed-git = "seed_git:main"
 seed-backup = "seed_backup:main"
 seed-agent-comparison = "agent_comparison:main"
+seed-wide-tree-benchmark = "wide_tree_benchmark:main"
 
 [tool.setuptools]
-py-modules = ["seed", "seed_client", "seed_server", "seed_postgres", "benchmark", "seed_agent", "seed_workspace", "workflow_benchmark", "seed_validation", "seed_git", "seed_backup", "agent_comparison"]
+py-modules = ["seed", "seed_client", "seed_server", "seed_postgres", "benchmark", "seed_agent", "seed_workspace", "workflow_benchmark", "seed_validation", "seed_git", "seed_backup", "agent_comparison", "wide_tree_benchmark"]
