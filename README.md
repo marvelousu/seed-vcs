@@ -382,7 +382,13 @@ demonstrate what happens when a dependency is not declared.
 For a deterministic comparison with automated Git and Git with equivalent
 dependency checks, run `python workflow_benchmark.py --output artifacts/workflow-replay.json`.
 See the [workflow guide](docs/agent-workflow.md#measure-before-extending-the-architecture)
-for what this replay measures and the real-agent measurements still needed.
+for what this replay measures and how it differs from live coding runs.
+
+The opt-in [live coding study](docs/live-agent-study.md) runs fresh Claude Code
+sessions on a small asset-review CLI using Seed, automated Git integration, and
+Git with an equivalent application-scope condition. Its protocol, correctness
+checks, repair limits, timing categories, and individual results are recorded
+separately from deterministic replay benchmarks. Live model calls never run in CI.
 
 [GitHub Actions](https://github.com/marvelousu/seed-vcs/actions/workflows/test.yml)
 runs the suite and demo on Ubuntu and Windows with Python 3.12. Tests and the

@@ -191,6 +191,22 @@ def _assert_public(value: Any, replacements: Iterable[tuple[str, str]]) -> None:
         raise ValueError("credential-like value in export")
 
 
+def _transport_records(input_root: Path) -> list[dict[str, Any]]:
+    """CLI transport only: excludes setup, peer writes and grading HTTP reads."""
+    records = []
+    for path in sorted(input_root.glob("runs/*/seed/*.json")):
+        if path.name not in {"task.json", "rework.json"}:
+            continue
+        events = [event for event in _read_json(path).get("metrics", [])
+                  if event.get("event") == "transport"]
+        records.append({"card": path.parents[1].name, "state": path.name,
+                        "scope": "agent CLI transport; excludes coordinator and evaluator",
+                        "stages": [{key: event[key] for key in
+                                    ("action", "requests", "upload_bytes", "download_bytes", "request_seconds")}
+                                   for event in events]})
+    return records
+
+
 def build_export(input_root: Path, output: Path, *, repo_root: Path | None = None) -> dict[str, Any]:
     """Build and write the public archive; raw records are never copied."""
     input_root = input_root.resolve()
@@ -212,6 +228,7 @@ def build_export(input_root: Path, output: Path, *, repo_root: Path | None = Non
         "result": _sanitize(result, replacements),
         "summaries": summaries,
         "sources": _source_records(input_root, replacements),
+        "seed_cli_transport": _transport_records(input_root),
     }
     _assert_public(archive, replacements)
     payload = json.dumps(archive, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
