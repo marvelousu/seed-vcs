@@ -70,7 +70,7 @@ not be mixed with new workers. See the upgrade instructions in
 ## Access and operation
 
 Bearer credentials are stored as SHA-256 digests in a server-side auth file.
-Entries restrict repository names and read/write/create permissions. Every
+Entries restrict repository names and read/write/create/validate/promote permissions. Every
 repository endpoint checks its scope before invoking the store. The default
 listener is loopback; remote clients use HTTPS through a TLS reverse proxy.
 
@@ -78,9 +78,7 @@ Request bodies, file counts, page sizes, batch sizes and connection pools have
 limits. Each worker has a bounded database pool. Uploaded bytes are separate
 from proposal metadata so retries do not need to resend file contents.
 
-Back up PostgreSQL and the object volume together. Retain all objects referenced
-by the backup; objects are not garbage-collected by the service. The PostgreSQL
-metadata schema is distinct from the SQLite file format.
+The logical backup command captures metadata and referenced objects at one pinned revision. Restore validates the archive before creating a fresh destination. See [backup.md](backup.md) for recovery and physical-backup requirements. Objects are not garbage-collected by the service; the PostgreSQL metadata schema is distinct from the SQLite file format.
 
 ## Validation
 
@@ -89,3 +87,26 @@ read capture, batch isolation, multi-process landing and retry tests. The
 benchmark reports the repository size, clients, completed proposals, latency
 percentiles, throughput, failures and environment. It measures this service;
 it does not extrapolate an unmeasured advantage over Git.
+
+## Candidate validation and delivery
+
+Version 0.4 separates the integrated head from verified and deployable revisions.
+A candidate previews a set of immutable proposals against one exact head, without
+publishing them. Validation reports identify that candidate's final tree and a
+required command/environment configuration. Publication takes the head lock only
+after tests finish, and rejects a candidate if the starting head has changed.
+A later failed report cannot be hidden by retrying an older successful report.
+Changing the validation policy also invalidates eligibility under the old policy.
+
+Validation and promotion have separate permissions from ordinary writes. Reports
+are attestations by a trusted validator; the server does not prove that a remote
+runner executed its command. Promotion selects an eligible exact revision and
+records the decision; it does not deploy an application. See
+[validation.md](validation.md) for the CLI and trust boundary.
+
+The [Git bridge](git-bridge.md) imports a pinned tree or exports an exact Seed
+revision to a dedicated Git branch with compare-and-swap ref updates. It does not
+translate Seed observations into Git commit semantics. The
+[agent comparison](agent-comparison.md) separates live coding traces from paired
+replays, and reports transport and rework costs without treating replay counts as
+independent model productivity samples.

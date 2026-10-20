@@ -28,6 +28,10 @@ Multiple service workers share PostgreSQL and the object volume.
   pending edits. Listings guard membership; searches guard the scoped subtree.
 - **Restartable agent tasks.** A JSON CLI saves task state, proposals and
   outcomes, and supports explicitly scoped command workspaces.
+- **Revision-bound validation.** Keep integrated, verified and deployable
+  revisions separate; optionally validate a combined candidate before landing.
+- **Git bridge and recovery.** Import a regular-file Git snapshot, export
+  revisions to a dedicated Git branch, and verify logical repository backups.
 - **Atomic landing.** File updates, history, and the head revision are published
   in one transaction, or rolled back together.
 - **Idempotent retries.** Landing an accepted proposal again returns its original
@@ -39,7 +43,7 @@ Multiple service workers share PostgreSQL and the object volume.
 - **Batch landing.** Accept multiple proposals in one transaction while keeping
   a separate result and revision for each successful proposal.
 - **Repository-scoped credentials.** Restrict a bearer credential to named
-  repositories and read, write or create permissions.
+  repositories and read, write, create, validate or promote permissions.
 - **Bounded queries.** File and revision listings use cursor-based pages.
 
 ## Quick start
@@ -132,6 +136,11 @@ their dependency conditions. Search output is bounded separately.
 
 The [agent workflow guide](docs/agent-workflow.md) covers the persistent
 `seed-agent` CLI, command workspaces, safe rework and the version 0.3 upgrade.
+
+Version 0.4 adds [validation and deployment targets](docs/validation.md),
+the [one-way Git bridge](docs/git-bridge.md), and [backup/restore](docs/backup.md).
+The [agent comparison guide](docs/agent-comparison.md) explains how captured
+coding traces are replayed against Seed and automated Git workflows.
 
 `Client.land_many(ids)` returns one result per proposal. Conflicts and namespace
 errors do not undo other successful proposals; a database failure rolls back
@@ -290,8 +299,9 @@ revision. Batch landing amortizes lock acquisition and durable commit overhead.
 
 [Architecture](docs/architecture.md) describes the protocol and transaction
 boundaries. The local task adapter materializes scoped regular-file workspaces;
-the core service publishes file states. Line-based merging and Git adapters are
-future extensions.
+the core service publishes file states. The Git bridge handles explicit one-way
+snapshot import and revision export. Line-based merging and simultaneous
+two-way synchronization remain separate design work.
 
 The following details matter when evaluating it:
 
@@ -322,7 +332,7 @@ authenticate a contributor or represent a review approval.
 Run the behavioral suite and demo from the repository directory:
 
 ```sh
-python -m unittest -v test_seed.py test_predicates.py
+python -m unittest -v test_seed.py test_predicates.py test_backup.BackupTests test_git.py test_comparison.py test_workflow_environment.py
 python demo.py
 ```
 
@@ -330,12 +340,13 @@ Install service test dependencies and run the HTTP contracts:
 
 ```sh
 python -m pip install httpx==0.28.1
-python -m unittest -v test_service.ServiceTests test_session.py test_agent.py
+python -m unittest -v test_service.ServiceTests test_session.py test_agent.py test_validation.ValidationTests
 ```
 
 Set `SEED_TEST_DATABASE_URL` to a **dedicated test database** and run
-`python -m unittest -v test_service.PostgresServiceTests` to exercise the same
-HTTP contracts on PostgreSQL. Tests create and remove their own random schemas.
+`python -m unittest -v test_service.PostgresServiceTests test_validation.PostgresValidationTests test_backup.PostgresBackupTests`
+to exercise the HTTP, validation and restore contracts on PostgreSQL. Tests
+create and remove their own random schemas.
 CI runs SQLite/core and service tests on Windows and Linux, PostgreSQL contracts
 on Linux, and builds the container image.
 
