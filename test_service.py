@@ -54,6 +54,9 @@ class ServiceTests(unittest.TestCase):
         self.other = "test_" + secrets.token_hex(8)
         self.token = secrets.token_urlsafe(32)
         self.reader = secrets.token_urlsafe(32)
+        self.validator = secrets.token_urlsafe(32)
+        self.operator = secrets.token_urlsafe(32)
+        self.write_only = secrets.token_urlsafe(32)
         auth = Auth.from_entries(
             [
                 {
@@ -66,6 +69,12 @@ class ServiceTests(unittest.TestCase):
                     "repositories": [self.repo],
                     "permissions": ["read"],
                 },
+                {"sha256": hashlib.sha256(self.write_only.encode()).hexdigest(),
+                 "repositories": [self.repo], "permissions": ["write"]},
+                {"sha256": hashlib.sha256(self.validator.encode()).hexdigest(),
+                 "repositories": [self.repo], "permissions": ["read", "validate"]},
+                {"sha256": hashlib.sha256(self.operator.encode()).hexdigest(),
+                 "repositories": [self.repo], "permissions": ["read", "promote"]},
             ]
         )
         self.app = create_app(root=self.root, auth=auth, dsn=self.dsn)

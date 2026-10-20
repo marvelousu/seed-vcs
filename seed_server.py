@@ -47,7 +47,7 @@ class Auth:
             if not repos or any(not re.fullmatch(REPOSITORY, r) for r in repos):
                 raise ValueError("Credentials must name their repositories")
             if not set(entry.get("permissions", [])).issubset(
-                {"read", "write", "create"}
+                {"read", "write", "create", "validate", "promote"}
             ):
                 raise ValueError("Invalid credential permissions")
 
@@ -149,6 +149,11 @@ class BodyLimit:
                 if scope["method"] in {"GET", "HEAD"}
                 else "write"
             )
+            if scope["method"] == "POST" and route[2] == "/validations":
+                permission = "validate"
+            elif ((scope["method"] == "PUT" and route[2] == "/validation-policy")
+                  or (scope["method"] == "POST" and route[2] == "/promotions")):
+                permission = "promote"
             try:
                 self.auth.check(
                     headers.get(b"authorization", b"").decode("latin1"),
@@ -215,6 +220,30 @@ class Proposal(BaseModel):
     message: str = Field(default="", max_length=4096)
 
 
+class ValidationPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    configurations: list[str] = Field(min_length=1, max_length=16)
+
+
+class ValidationReport(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    kind: Literal["candidate", "revision"]
+    subject: str = Field(pattern=IDENTIFIER)
+    configuration: str = Field(pattern=IDENTIFIER)
+    environment: str = Field(pattern=IDENTIFIER)
+    passed: bool
+    returncode: int | None
+    timed_out: bool = False
+    elapsed_ms: int = Field(default=0, ge=0, le=86_400_000)
+    log_digest: str = Field(pattern=IDENTIFIER)
+    request: str = Field(min_length=1, max_length=128)
+
+
+class RevisionSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    revision: str = Field(pattern=IDENTIFIER)
+
+
 class Landing(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     proposal: str = Field(pattern=IDENTIFIER)
@@ -244,7 +273,7 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
         finally:
             provider.close()
 
-    app = FastAPI(title="Seed", version="0.3.0", lifespan=lifespan)
+    app = FastAPI(title="Seed", version="0.4.0", lifespan=lifespan)
     app.add_middleware(BodyLimit, auth=auth)
     app.state.provider = provider
 
@@ -260,6 +289,7 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
         access("write"),
         access("create"),
     )
+    validate_access, promote_access = access("validate"), access("promote")
 
     @app.exception_handler(Conflict)
     async def conflict_handler(request, exc):
@@ -296,6 +326,41 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
     @app.get("/v1/repos/{repo}/head")
     def head(repo: str = Depends(read_access)):
         return {"revision": provider.repository(repo).head()}
+
+    @app.post("/v1/repos/{repo}/candidates", dependencies=[Depends(read_access)])
+    def candidate_create(body: Batch, repo: str = Depends(write_access)):
+        from seed_validation import create_candidate
+        return create_candidate(provider.repository(repo), body.proposals)
+
+    @app.get("/v1/repos/{repo}/candidates/{identifier}")
+    def candidate_read(identifier: str, repo: str = Depends(read_access)):
+        from seed_validation import candidate
+        return candidate(provider.repository(repo), identifier)
+
+    @app.post("/v1/repos/{repo}/candidates/{identifier}/publish")
+    def candidate_publish(identifier: str, repo: str = Depends(write_access)):
+        from seed_validation import publish_candidate
+        return publish_candidate(provider.repository(repo), identifier)
+
+    @app.put("/v1/repos/{repo}/validation-policy")
+    def policy_update(body: ValidationPolicy, repo: str = Depends(promote_access)):
+        from seed_validation import set_policy
+        return set_policy(provider.repository(repo), body.configurations)
+
+    @app.get("/v1/repos/{repo}/validation-state")
+    def validation_state_read(repo: str = Depends(read_access)):
+        from seed_validation import validation_state
+        return validation_state(provider.repository(repo))
+
+    @app.post("/v1/repos/{repo}/validations")
+    def validation_record(body: ValidationReport, repo: str = Depends(validate_access)):
+        from seed_validation import record_validation
+        return record_validation(provider.repository(repo), **body.model_dump())
+
+    @app.post("/v1/repos/{repo}/promotions")
+    def revision_promote(body: RevisionSelection, repo: str = Depends(promote_access)):
+        from seed_validation import promote
+        return promote(provider.repository(repo), body.revision)
 
     @app.put("/v1/repos/{repo}/blobs/{identifier}")
     async def upload(
@@ -487,7 +552,7 @@ def main(argv=None):
     token.add_argument(
         "--permissions",
         nargs="+",
-        choices=["read", "write", "create"],
+        choices=["read", "write", "create", "validate", "promote"],
         default=["read", "write", "create"],
     )
     serve = commands.add_parser("serve")

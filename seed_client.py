@@ -262,6 +262,29 @@ class Client:
     def land(self, proposal):
         return self._request("POST", "/land", {"proposal": proposal})
 
+    def create_candidate(self, proposals):
+        return self._request("POST", "/candidates", {"proposals": list(proposals)})
+
+    def candidate(self, identifier):
+        from seed_validation import identifier as validate_id
+        return self._request("GET", "/candidates/" + validate_id(identifier))
+
+    def publish_candidate(self, identifier):
+        from seed_validation import identifier as validate_id
+        return self._request("POST", "/candidates/" + validate_id(identifier) + "/publish", {})
+
+    def set_validation_policy(self, configurations):
+        return self._request("PUT", "/validation-policy", {"configurations": list(configurations)})
+
+    def record_validation(self, **report):
+        return self._request("POST", "/validations", report)
+
+    def validation_state(self):
+        return self._request("GET", "/validation-state")
+
+    def promote(self, revision):
+        return self._request("POST", "/promotions", {"revision": revision})
+
     def land_many(self, proposals):
         return self._request("POST", "/land-batch", {"proposals": list(proposals)})[
             "results"
