@@ -71,7 +71,7 @@ def _run(command: list[str], *, cwd: Path, env: dict[str, str] | None = None,
 
 def _clean_env() -> dict[str, str]:
     return {key: value for key, value in os.environ.items()
-            if not key.upper().startswith("GIT_") and key.upper() != "SEED_TOKEN"}
+            if not key.upper().startswith(("GIT_", "SEED_"))}
 
 
 def _git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

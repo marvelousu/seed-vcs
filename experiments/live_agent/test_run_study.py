@@ -47,10 +47,11 @@ if __name__ == "__main__": raise SystemExit(main())
 
 class LiveStudySmokeTests(unittest.TestCase):
     def test_git_environment_cannot_redirect_the_disposable_repository(self):
-        with patch.dict(os.environ, {"GIT_DIR": "invalid", "git_work_tree": "invalid", "SEED_TOKEN": "private"}):
+        with patch.dict(os.environ, {"GIT_DIR": "invalid", "git_work_tree": "invalid", "SEED_TOKEN": "private", "SEED_DATABASE_URL": "invalid"}):
             cleaned = run_study._clean_env()
         self.assertFalse(any(key.upper().startswith("GIT_") for key in cleaned))
         self.assertNotIn("SEED_TOKEN", cleaned)
+        self.assertNotIn("SEED_DATABASE_URL", cleaned)
 
     def test_fake_adapter_exercises_all_cells_and_rework_without_a_model(self):
         parent = Path("artifacts/tmp").resolve()
