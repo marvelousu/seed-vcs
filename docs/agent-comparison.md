@@ -104,3 +104,36 @@ oracle. It never chooses or pays for a model. To finish the initial 3 x 5 pilot,
 record one real coding trace containing all three workload groups, then replay
 its fixed outputs five times and report replay repetitions separately from the
 number of real agent runs.
+
+## Initial captured-sample result
+
+The [captured example](../examples/comparison-live-20261020.json) contains one
+coding sample for each of the three groups, recorded through `Client`/`Session`
+and the HTTP contract. The examples are small pricing tasks; they are not a
+representative production workload. Model tokens and cost were unavailable and
+remain `null`.
+
+[CI run 39364467645](https://github.com/marvelousu/seed-vcs/actions/runs/39364467645)
+replayed each fixed result five times on Linux, producing 15 observations per
+backend (45 total). These are repetitions of three captured changes, not 15
+independent coding sessions.
+
+| Backend | Accepted | Stale-input accepts | Conservative rejections |
+| --- | ---: | ---: | ---: |
+| Seed | 5 / 15 | 0 / 15 | 5 / 15 |
+| Git worktree and merge | 15 / 15 | 5 / 15 | 0 / 15 |
+| Git worktree with captured dependency checks | 5 / 15 | 0 / 15 | 5 / 15 |
+
+The stale-input column uses the trace's declared oracle: the derived quote was
+computed before its input changed. It does not imply that ordinary Git promises
+to check runtime dependencies. Seed and the conditional Git workflow made the
+same decisions. Both conservatively rejected the independent line edit in a
+shared file, and both required reintegration for two of the three groups.
+
+The live trace records successful reread/rework after those conflicts. The paired
+replay evaluates the original fixed outputs rather than asking the model to
+solve each conflict again. Timing is recorded in the downloadable CI artifact,
+but the in-process Seed backend and filesystem Git backends do not establish a
+service throughput, end-to-end cost, or productivity advantage. The result
+supports the dependency-check behavior and its conservative tradeoff; it does
+not establish that a new VCS is necessary instead of a Git-based agent adapter.
