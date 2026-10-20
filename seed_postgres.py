@@ -142,6 +142,9 @@ CREATE TABLE versions (
 
 
 class PostgresStore(Store):
+    FORMAT = "seed/pg1"
+    FORMAT_V2 = "seed/pg2"
+
     def __init__(self, pool, repository, objects):
         self.pool = pool
         self.schema = "seed_" + hashlib.sha256(repository.encode()).hexdigest()[:32]
@@ -182,7 +185,7 @@ class PostgresStore(Store):
                 row = connection.execute(
                     "SELECT value FROM meta WHERE key='format'"
                 ).fetchone()
-                if row is None or row["value"] != "seed/pg1":
+                if row is None or row["value"] not in ("seed/pg1", "seed/pg2"):
                     raise SeedError("Unsupported PostgreSQL repository format")
         return store
 

@@ -11,6 +11,7 @@ import re
 import secrets
 import sqlite3
 import threading
+from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
@@ -102,6 +103,10 @@ class Provider:
                         ).fetchone()
                     if row is None:
                         raise HTTPException(404, "Repository not found")
+                    with store._db() as db:
+                        version = db.execute("SELECT value FROM meta WHERE key='format'").fetchone()
+                        if version is None or version[0] not in (store.FORMAT, store.FORMAT_V2):
+                            raise SeedError("Unsupported PostgreSQL repository format")
             else:
                 path = (
                     self.root
@@ -193,11 +198,19 @@ class BodyLimit:
         await self.app(scope, replay, send)
 
 
+class RangeCondition(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    kind: Literal["membership", "subtree"]
+    prefix: str = Field(default="", max_length=2048)
+
+
 class Proposal(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     base: str = Field(pattern=IDENTIFIER)
     writes: dict[str, str | None] = Field(min_length=1, max_length=1000)
     reads: list[str] = Field(default_factory=list, max_length=1000)
+    ranges: list[RangeCondition] = Field(default_factory=list, max_length=64)
+    supersedes: str | None = Field(default=None, pattern=IDENTIFIER)
     author: str = Field(default="", max_length=256)
     message: str = Field(default="", max_length=4096)
 
@@ -231,7 +244,7 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
         finally:
             provider.close()
 
-    app = FastAPI(title="Seed", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="Seed", version="0.3.0", lifespan=lifespan)
     app.add_middleware(BodyLimit, auth=auth)
     app.state.provider = provider
 
@@ -251,7 +264,8 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
     @app.exception_handler(Conflict)
     async def conflict_handler(request, exc):
         return JSONResponse(
-            {"status": "conflict", "paths": exc.differences}, status_code=409
+            {"status": "conflict", "paths": exc.differences,
+             "head": getattr(exc, "head", None)}, status_code=409
         )
 
     @app.exception_handler(SeedError)
@@ -338,6 +352,17 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
     ):
         return provider.repository(repo).log_page(after=after, limit=limit)
 
+    @app.get("/v1/repos/{repo}/range")
+    def range_snapshot(
+        prefix: str = Query(default="", max_length=2048),
+        kind: Literal["membership", "subtree"] = "membership",
+        revision: str | None = Query(default=None, pattern=IDENTIFIER),
+        repo: str = Depends(read_access),
+    ):
+        return provider.repository(repo).range_snapshot(
+            prefix=prefix, kind=kind, revision=revision
+        )
+
     @app.post("/v1/repos/{repo}/proposals")
     def propose(body: Proposal, repo: str = Depends(write_access)):
         for path in set(body.writes) | set(body.reads):
@@ -353,6 +378,8 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
             body.base,
             body.writes,
             reads=body.reads,
+            ranges=[condition.model_dump() for condition in body.ranges],
+            supersedes=body.supersedes,
             author=body.author,
             message=body.message,
         )
@@ -361,6 +388,12 @@ def create_app(*, root=None, auth_file=None, auth=None, dsn=None, pool_size=None
     @app.get("/v1/repos/{repo}/proposals/{identifier}")
     def describe(identifier: str, repo: str = Depends(read_access)):
         return provider.repository(repo).describe(identifier)
+
+    @app.get("/v1/repos/{repo}/proposals/{identifier}/status")
+    def proposal_status(identifier: str, repo: str = Depends(read_access)):
+        if not re.fullmatch(IDENTIFIER, identifier):
+            raise HTTPException(422, "Invalid proposal ID")
+        return provider.repository(repo).proposal_status(identifier)
 
     @app.post("/v1/repos/{repo}/land")
     def land(body: Landing, repo: str = Depends(write_access)):

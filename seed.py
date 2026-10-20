@@ -1,7 +1,7 @@
-"""Seed: conditional change packages, not a production Git replacement.
+"""Seed: atomic conditional change packages with versioned dependency guards.
 
-Python 3.12+, standard library only. Logical POSIX file paths; no checkout.
-The SQLite transaction is the only publication boundary.
+Python 3.12+, standard-library core with logical POSIX file paths.
+Publication checks and file updates share one database transaction.
 """
 from __future__ import annotations
 
@@ -20,8 +20,9 @@ class SeedError(Exception):
 
 
 class Conflict(SeedError):
-    def __init__(self, differences: dict):
+    def __init__(self, differences: dict, *, head: str | None = None):
         self.differences = differences
+        self.head = head
         super().__init__("Conditions changed: " + ", ".join(differences))
 
 
@@ -40,6 +41,37 @@ def file_path(path: str) -> str:
             or any(part in ("", ".", "..") for part in path.split("/"))):
         raise SeedError(f"Not a canonical relative file path: {path!r}")
     return path
+
+
+MAX_RANGE_FILES = 10_000
+MAX_RANGES = 64
+# A trailing slash cannot name a canonical file. A non-hash expected value also
+# forces pre-v2 writers (which did not check proposal format) to reject it.
+V2_WRITER_GUARD = "@seed/protocol-v2/"
+
+
+def normalize_prefix(prefix: object) -> str:
+    """Return a canonical directory prefix, with the root represented by ``''``."""
+    if not isinstance(prefix, str):
+        raise SeedError(f"Not a directory prefix: {prefix!r}")
+    if prefix == "":
+        return ""
+    if "\\" in prefix or "\0" in prefix:
+        raise SeedError(f"Not a directory prefix: {prefix!r}")
+    trimmed = prefix[:-1] if prefix.endswith("/") else prefix
+    if (not trimmed or any(part in ("", ".", "..") for part in trimmed.split("/"))):
+        raise SeedError(f"Not a directory prefix: {prefix!r}")
+    return trimmed + "/"
+
+
+def _range_fingerprint(kind: str, paths: list[str], files: dict[str, str]) -> str:
+    if kind == "membership":
+        payload = paths
+    elif kind == "subtree":
+        payload = [[path, files[path]] for path in paths]
+    else:
+        raise SeedError("Unknown range kind: " + repr(kind))
+    return hashlib.sha256(canonical(payload)).hexdigest()
 
 
 SCHEMA = """
@@ -67,6 +99,9 @@ CREATE TABLE versions (
 
 
 class Store:
+    FORMAT = "seed/1"
+    FORMAT_V2 = "seed/2"
+
     def __init__(self, database: str | Path):
         self.database = Path(database).resolve()
         if not self.database.is_file():
@@ -74,7 +109,7 @@ class Store:
         try:
             with self._db() as db:
                 row = db.execute("SELECT value FROM meta WHERE key='format'").fetchone()
-                if row is None or row[0] != "seed/1":
+                if row is None or row[0] not in (self.FORMAT, self.FORMAT_V2):
                     raise SeedError("Unsupported database format")
         except sqlite3.DatabaseError as exc:
             raise SeedError("Not a Seed database") from exc
@@ -95,7 +130,7 @@ class Store:
             root = object_id("revision", canonical({"parent": None, "proposal": None}))
             db.execute("INSERT INTO revisions VALUES (0, ?, NULL, NULL)", (root,))
             db.executemany("INSERT INTO meta VALUES (?, ?)",
-                           [("format", "seed/1"), ("head", root)])
+                           [("format", cls.FORMAT), ("head", root)])
             db.commit()
         finally:
             db.close()
@@ -151,14 +186,21 @@ class Store:
         row = db.execute("SELECT payload FROM proposals WHERE id=?", (identifier,)).fetchone()
         if row is None or object_id("proposal", row[0]) != identifier:
             raise SeedError("Missing or damaged proposal: " + identifier)
-        return json.loads(row[0])
+        try:
+            body = json.loads(row[0])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise SeedError("Damaged proposal: " + identifier) from exc
+        if not isinstance(body, dict) or body.get("format") not in (1, 2):
+            raise SeedError("Unsupported proposal format")
+        return body
 
     def head(self) -> str:
         with self._db() as db:
             return self._head(db)
 
     def propose(self, base: str, edits: Mapping[str, bytes | None], *,
-                reads: Iterable[str] = (), author: str = "", message: str = "") -> str:
+                reads: Iterable[str] = (), ranges: Iterable[Mapping[str, object]] = (),
+                supersedes: str | None = None, author: str = "", message: str = "") -> str:
         """Freeze file predicates at base. No-op edits are omitted entirely."""
         if isinstance(reads, str):
             raise SeedError("reads must be a collection of paths, not a string")
@@ -172,7 +214,8 @@ class Store:
                 if payload is not None and not isinstance(payload, bytes):
                     raise SeedError("File contents must be bytes or None")
                 writes[path] = None if payload is None else self._put_blob(db, payload)
-            return self._freeze(db, base, writes, read_paths, author, message)
+            return self._freeze(db, base, writes, read_paths, ranges, supersedes,
+                                author, message)
 
     def _put_blob(self, db, payload: bytes) -> str:
         identifier = object_id("blob", payload)
@@ -197,7 +240,8 @@ class Store:
             self._verify_blob(db, identifier)
 
     def propose_refs(self, base: str, writes: Mapping[str, str | None], *,
-                     reads: Iterable[str] = (), author: str = "", message: str = "") -> str:
+                     reads: Iterable[str] = (), ranges: Iterable[Mapping[str, object]] = (),
+                     supersedes: str | None = None, author: str = "", message: str = "") -> str:
         """Submit previously uploaded blobs without transferring their bytes again."""
         if isinstance(reads, str):
             raise SeedError("reads must be a collection of paths")
@@ -205,21 +249,74 @@ class Store:
             for path, blob in writes.items():
                 file_path(path)
             self._verify_blobs(db, (b for b in writes.values() if b is not None))
-            return self._freeze(db, base, writes, {file_path(p) for p in reads}, author, message)
+            return self._freeze(db, base, writes, {file_path(p) for p in reads},
+                                ranges, supersedes, author, message)
 
-    def _freeze(self, db, base, writes, read_paths, author, message):
+    @staticmethod
+    def _normalize_ranges(ranges: Iterable[Mapping[str, object]]) -> list[dict[str, str]]:
+        if isinstance(ranges, (str, bytes)):
+            raise SeedError("ranges must be a collection of descriptors")
+        try:
+            descriptors = list(ranges)
+        except TypeError as exc:
+            raise SeedError("ranges must be a collection of descriptors") from exc
+        if len(descriptors) > MAX_RANGES:
+            raise SeedError(f"At most {MAX_RANGES} range predicates")
+        normalized = []
+        seen = set()
+        for descriptor in descriptors:
+            if not isinstance(descriptor, Mapping):
+                raise SeedError("Range descriptor must be a mapping")
+            if set(descriptor) != {"kind", "prefix"}:
+                raise SeedError("Range descriptor requires only kind and prefix")
+            kind = descriptor["kind"]
+            if kind not in ("membership", "subtree"):
+                raise SeedError("Unknown range kind: " + repr(kind))
+            prefix = normalize_prefix(descriptor["prefix"])
+            key = (kind, prefix)
+            if key in seen:
+                raise SeedError("Duplicate range predicate")
+            seen.add(key)
+            normalized.append({"kind": kind, "prefix": prefix})
+        return sorted(normalized, key=lambda item: (item["kind"], item["prefix"]))
+
+    def _freeze(self, db, base, writes, read_paths, ranges, supersedes, author, message):
         if not isinstance(author, str) or not isinstance(message, str):
             raise SeedError("author and message must be strings")
         seq = self._revision(db, base)["seq"]
+        descriptors = self._normalize_ranges(ranges)
+        if supersedes is not None:
+            if not isinstance(supersedes, str):
+                raise SeedError("supersedes must be a proposal ID or None")
+            self._proposal(db, supersedes)
         expected = self._at_many(db, set(writes) | read_paths, seq)
         writes = {p: b for p, b in writes.items() if b != expected[p]}
         expected = {p: b for p, b in expected.items() if p in writes or p in read_paths}
         if not writes:
             raise SeedError("No effective writes; conditions-only proposals are unsupported")
-        body = canonical({"format": 1, "base": base, "expected": expected,
-                          "writes": writes, "author": author, "message": message})
+        if not descriptors and supersedes is None:
+            body_value = {"format": 1, "base": base, "expected": expected,
+                          "writes": writes, "author": author, "message": message}
+        else:
+            frozen_ranges = []
+            for descriptor in descriptors:
+                snapshot = self._range_snapshot(db, descriptor["prefix"],
+                                                descriptor["kind"], base, seq)
+                frozen_ranges.append({**descriptor, "fingerprint": snapshot["fingerprint"]})
+            body_value = {"format": 2, "base": base, "expected": expected,
+                          "writes": writes, "ranges": frozen_ranges,
+                          "author": author, "message": message}
+            body_value["expected"] = {**expected, V2_WRITER_GUARD: {"requires": 2}}
+            if supersedes is not None:
+                body_value["supersedes"] = supersedes
+        body = canonical(body_value)
         identifier = object_id("proposal", body)
         db.execute("INSERT OR IGNORE INTO proposals VALUES (?, ?)", (identifier, body))
+        # Old Seed versions reject a seed/2 repository on open instead of silently
+        # treating the additional predicates as an ordinary format-1 proposal.
+        if body_value["format"] == 2:
+            db.execute("UPDATE meta SET value=? WHERE key='format' AND value=?",
+                       (self.FORMAT_V2, self.FORMAT))
         return identifier
 
     @classmethod
@@ -249,6 +346,55 @@ class Store:
             result.update((row["path"], row["blob"]) for row in rows)
         return result
 
+    @staticmethod
+    def _prefix_bounds(prefix: str) -> tuple[str, str | None]:
+        """Return lexical bounds for paths inside a canonical directory prefix."""
+        if prefix == "":
+            return "", None
+        # '/' immediately precedes '0' in byte/C collation. This includes prefix
+        # descendants while excluding siblings such as ``src0``.
+        return prefix, prefix[:-1] + "0"
+
+    def _range_files(self, db, prefix: str, seq: int) -> dict[str, str]:
+        lower, upper = self._prefix_bounds(prefix)
+        limit = MAX_RANGE_FILES + 1
+        # Do not substitute current_files merely because revision currently equals
+        # head. PostgreSQL proposal creation has no head lock, so that comparison
+        # can become stale before its range query runs.
+        if upper is None:
+            rows = db.execute(
+                "SELECT v.path, v.blob FROM versions v JOIN "
+                "(SELECT path, MAX(seq) seq FROM versions WHERE seq<=? GROUP BY path) latest "
+                "USING(path, seq) WHERE v.blob IS NOT NULL ORDER BY v.path LIMIT ?",
+                (seq, limit))
+        else:
+            rows = db.execute(
+                "SELECT v.path, v.blob FROM versions v JOIN "
+                "(SELECT path, MAX(seq) seq FROM versions WHERE seq<=? AND path>=? AND path<? "
+                "GROUP BY path) latest USING(path, seq) WHERE v.blob IS NOT NULL "
+                "ORDER BY v.path LIMIT ?", (seq, lower, upper, limit))
+        files = {row["path"]: row["blob"] for row in rows}
+        if len(files) > MAX_RANGE_FILES:
+            raise SeedError(f"Range contains more than {MAX_RANGE_FILES} files")
+        return files
+
+    def _range_snapshot(self, db, prefix: str, kind: str, revision: str, seq: int) -> dict:
+        files = self._range_files(db, prefix, seq)
+        paths = sorted(files)
+        return {"revision": revision, "prefix": prefix, "kind": kind,
+                "paths": paths, "files": {path: files[path] for path in paths},
+                "fingerprint": _range_fingerprint(kind, paths, files)}
+
+    def range_snapshot(self, prefix: str = "", kind: str = "membership",
+                       revision: str | None = None) -> dict:
+        prefix = normalize_prefix(prefix)
+        if kind not in ("membership", "subtree"):
+            raise SeedError("Unknown range kind: " + repr(kind))
+        with self._db() as db:
+            revision = revision or self._head(db)
+            seq = self._revision(db, revision)["seq"]
+            return self._range_snapshot(db, prefix, kind, revision, seq)
+
     def _lock_head(self, db):
         # SQLite's BEGIN IMMEDIATE already serializes publishers.
         pass
@@ -272,7 +418,8 @@ class Store:
                     result = self._land(db, proposal)
                 except (Conflict, SeedError) as exc:
                     db.execute("ROLLBACK TO SAVEPOINT proposal_landing")
-                    result = ({"status": "conflict", "paths": exc.differences}
+                    result = ({"status": "conflict", "paths": exc.differences,
+                               "head": exc.head}
                               if isinstance(exc, Conflict) else
                               {"status": "error", "message": str(exc)})
                 db.execute("RELEASE SAVEPOINT proposal_landing")
@@ -285,14 +432,39 @@ class Store:
         if landed:
             return {"revision": landed[0], "status": "already-landed"}
         parent = self._head(db)
+        parent_seq = self._revision(db, parent)["seq"]
         differences = {}
-        current = self._current_many(db, body["expected"])
-        for path, expected in sorted(body["expected"].items()):
+        expected_paths = dict(body["expected"])
+        if body["format"] == 2:
+            if expected_paths.pop(V2_WRITER_GUARD, None) != {"requires": 2}:
+                raise SeedError("Unsupported proposal writer guard")
+        current = self._current_many(db, expected_paths)
+        for path, expected in sorted(expected_paths.items()):
             actual = current[path]
             if actual != expected:
-                differences[path] = {"expected": expected, "actual": actual}
+                differences[path] = {"expected": expected, "actual": actual,
+                                     "kind": "content"}
+        if body["format"] == 2:
+            ranges = body.get("ranges")
+            if not isinstance(ranges, list):
+                raise SeedError("Unsupported proposal format")
+            for descriptor in ranges:
+                if (not isinstance(descriptor, dict)
+                        or set(descriptor) != {"kind", "prefix", "fingerprint"}
+                        or not isinstance(descriptor["fingerprint"], str)):
+                    raise SeedError("Unsupported proposal format")
+                kind = descriptor["kind"]
+                prefix = normalize_prefix(descriptor["prefix"])
+                if kind not in ("membership", "subtree"):
+                    raise SeedError("Unsupported proposal format")
+                actual = self._range_snapshot(db, prefix, kind, parent, parent_seq)["fingerprint"]
+                expected = descriptor["fingerprint"]
+                if actual != expected:
+                    key = f"@range:{kind}:{prefix}"
+                    differences[key] = {"expected": expected, "actual": actual,
+                                        "kind": kind, "prefix": prefix}
         if differences:
-            raise Conflict(differences)
+            raise Conflict(differences, head=parent)
         # Apply to CURRENT state, never replace it with the author's base tree.
         present = [(path, blob) for path, blob in body["writes"].items() if blob is not None]
         self._verify_blobs(db, (blob for _, blob in present))
@@ -351,6 +523,15 @@ class Store:
     def describe(self, proposal: str) -> dict:
         with self._db() as db:
             return self._proposal(db, proposal)
+
+    def proposal_status(self, proposal: str) -> dict:
+        with self._db() as db:
+            self._proposal(db, proposal)
+            landed = db.execute("SELECT id FROM revisions WHERE proposal=?", (proposal,)).fetchone()
+            return {"proposal": proposal,
+                    "status": "landed" if landed else "pending",
+                    "revision": landed[0] if landed else None,
+                    "head": self._head(db)}
 
     def snapshot(self, paths: Iterable[str], revision: str | None = None) -> dict:
         paths = {file_path(p) for p in paths}
