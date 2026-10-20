@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import unittest
 
+from seed import Store
 import wide_tree_benchmark as benchmark
 
 
@@ -94,6 +95,53 @@ class WideTreeGitContracts(unittest.TestCase):
             benchmark._verify_git(prepared, repo, unsafe, head)
         with self.assertRaises(AssertionError):
             benchmark._verify_git(prepared, repo, decisions, prepared.git_background)
+
+    @staticmethod
+    def _proposal(number, path, payload, expected):
+        return benchmark.Proposal(
+            number, path, payload, "", {}, benchmark._git_blob_id(payload),
+            expected, b"audit\n", "",
+        )
+
+    def test_sequential_selector_rejects_same_path_second_writer_like_seed(self):
+        with self._directory() as directory:
+            store = Store.create(Path(directory) / "seed.db")
+            base = store.head()
+            base = store.land(store.propose(base, {"a.txt": b"base\n"}))["revision"]
+            first = store.propose(base, {"a.txt": b"first\n"})
+            second = store.propose(base, {"a.txt": b"second\n"})
+            seed = store.land_many([first, second])
+            original = benchmark._git_blob_id(b"base\n")
+            group = [
+                self._proposal(0, "a.txt", b"first\n", {"a.txt": original}),
+                self._proposal(1, "a.txt", b"second\n", {"a.txt": original}),
+            ]
+            current = {"a.txt": original}
+            accepted, decisions = benchmark._select_accepted(group, current)
+            self.assertEqual([item["status"] == "landed" for item in seed],
+                             [item["accepted"] for item in decisions])
+            self.assertEqual(accepted, group[:1])
+            self.assertEqual(current["a.txt"], group[0].git_blob)
+
+    def test_sequential_selector_rejects_read_staled_by_earlier_writer_like_seed(self):
+        with self._directory() as directory:
+            store = Store.create(Path(directory) / "seed.db")
+            base = store.head()
+            base = store.land(store.propose(base, {"source.txt": b"zero\n", "out.txt": b"old\n"}))["revision"]
+            writer = store.propose(base, {"source.txt": b"one\n"})
+            reader = store.propose(base, {"out.txt": b"derived\n"}, reads=["source.txt"])
+            seed = store.land_many([writer, reader])
+            source, output = benchmark._git_blob_id(b"zero\n"), benchmark._git_blob_id(b"old\n")
+            group = [
+                self._proposal(0, "source.txt", b"one\n", {"source.txt": source}),
+                self._proposal(1, "out.txt", b"derived\n", {"source.txt": source, "out.txt": output}),
+            ]
+            current = {"source.txt": source, "out.txt": output}
+            accepted, decisions = benchmark._select_accepted(group, current)
+            self.assertEqual([item["status"] == "landed" for item in seed],
+                             [item["accepted"] for item in decisions])
+            self.assertEqual(accepted, group[:1])
+            self.assertEqual(current, {"source.txt": group[0].git_blob, "out.txt": output})
 
 
 if __name__ == "__main__":  # pragma: no cover

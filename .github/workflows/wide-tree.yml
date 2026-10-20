@@ -5,12 +5,14 @@ on:
     paths:
       - wide_tree_benchmark.py
       - test_wide_tree_benchmark.py
+      - test_wide_tree_contracts.py
       - seed.py
       - .github/workflows/wide-tree.yml
   pull_request:
     paths:
       - wide_tree_benchmark.py
       - test_wide_tree_benchmark.py
+      - test_wide_tree_contracts.py
       - seed.py
       - .github/workflows/wide-tree.yml
   workflow_dispatch:

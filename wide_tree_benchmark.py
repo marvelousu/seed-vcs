@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import sqlite3
 import statistics
@@ -73,6 +74,28 @@ def _environment() -> dict[str, str]:
     return result
 
 
+def _git_version() -> tuple[str, tuple[int, int, int]]:
+    """Return and enforce the Git version required by the fast-import protocol."""
+    raw = _git(ROOT, "--version").stdout.decode("utf-8", "replace").strip()
+    matched = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", raw)
+    if matched is None:
+        raise RuntimeError("could not determine Git version: " + raw)
+    version = tuple(int(part or 0) for part in matched.groups())
+    if version < (2, 43, 0):
+        raise RuntimeError("wide-tree benchmark requires Git 2.43 or newer, got " + raw)
+    return raw, version
+
+
+def _source_metadata() -> dict[str, Any]:
+    """Identify this module whether it runs from a checkout or an installed wheel."""
+    commit_result = _git(ROOT, "rev-parse", "HEAD", check=False)
+    status_result = _git(ROOT, "status", "--porcelain", check=False)
+    in_checkout = commit_result.returncode == 0 and status_result.returncode == 0
+    return {"commit": commit_result.stdout.decode().strip() if in_checkout else None,
+            "dirty": bool(status_result.stdout) if in_checkout else None,
+            "sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+
+
 def _git_blob_id(payload: bytes) -> str:
     return hashlib.sha1(b"blob " + str(len(payload)).encode() + b"\0" + payload).hexdigest()
 
@@ -99,7 +122,7 @@ def _git(root: Path, *arguments: str, data: bytes | None = None,
 
 def _cpu() -> tuple[float | None, float | None]:
     if os.name == "nt":
-        return time.process_time(), None
+        return None, None
     import resource
     own = resource.getrusage(resource.RUSAGE_SELF)
     children = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -183,11 +206,10 @@ def _checkpoint(path: Path) -> None:
     try:
         db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         mode = db.execute("PRAGMA journal_mode").fetchone()[0].lower()
-        sync = db.execute("PRAGMA synchronous").fetchone()[0]
     finally:
         db.close()
-    if mode != "wal" or sync != 2:
-        raise RuntimeError(f"Seed SQLite must be WAL/FULL, got {mode}/{sync}")
+    if mode != "wal":
+        raise RuntimeError(f"Seed SQLite must be WAL, got {mode}")
 
 
 def prepare(root: Path, width: int, layout: str, proposals: int) -> Prepared:
@@ -273,10 +295,67 @@ def _chunks(values: list[Proposal], size: int) -> list[list[Proposal]]:
     return [values[index:index + size] for index in range(0, len(values), size)]
 
 
+def _seed_durability(store: Store) -> dict[str, Any]:
+    """Check the actual Store connection configuration before its timed calls."""
+    with store._db(write=True) as db:
+        result = {"journal_mode": db.execute("PRAGMA journal_mode").fetchone()[0].lower(),
+                  "synchronous": db.execute("PRAGMA synchronous").fetchone()[0]}
+    if result != {"journal_mode": "wal", "synchronous": 2}:
+        raise RuntimeError("Seed Store connection is not WAL/FULL: " + repr(result))
+    return result
+
+
+def _flush_tree(root: Path) -> float:
+    """Persist setup files before opening the publication timing window."""
+    began = time.perf_counter()
+    # Windows does not expose a portable fsync operation for Git's read-only
+    # object files.  The POSIX barrier is therefore reported as unavailable
+    # there instead of silently switching to a system-wide cache flush.
+    if os.name == "nt":
+        return time.perf_counter() - began
+    files: list[Path] = []
+    directories: set[Path] = set()
+    for directory, _, names in os.walk(root):
+        current = Path(directory)
+        directories.add(current)
+        files.extend(current / name for name in names)
+    for path in files:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    if os.name != "nt":
+        for path in directories:
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    return time.perf_counter() - began
+
+
+def _select_accepted(group: list[Proposal], current: dict[str, str]) -> tuple[list[Proposal], list[dict[str, Any]]]:
+    """Apply conditional proposals in order, matching Seed ``land_many`` semantics."""
+    accepted: list[Proposal] = []
+    decisions: list[dict[str, Any]] = []
+    for item in group:
+        matches = all(current.get(path) == expected for path, expected in item.git_expected.items())
+        decisions.append({"proposal": item.number, "accepted": matches,
+                          "status": "landed" if matches else "conflict",
+                          "git_audit_blob": item.git_audit_blob, "audit": item.audit.decode()})
+        if matches:
+            accepted.append(item)
+            current[item.path] = item.git_blob
+    return accepted, decisions
+
+
 def _seed_publish(prepared: Prepared, target: Path, batch: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     setup_began = time.perf_counter()
     store = _copy_seed(prepared, target)
     store.land(prepared.seed_background)  # advancing head is deliberately outside timing
+    durability = _seed_durability(store)
+    flush_seconds = _flush_tree(target)
     setup_seconds = time.perf_counter() - setup_began
     baseline_storage = _sqlite_stats(store.database)
     parent_cpu, child_cpu = _cpu()
@@ -291,11 +370,18 @@ def _seed_publish(prepared: Prepared, target: Path, batch: int) -> tuple[list[di
     parent_after, child_after = _cpu()
     report = _verify_seed(prepared, store, decisions)
     before = _sqlite_stats(store.database)
+    maintenance_began = time.perf_counter()
     _vacuum(store.database)
+    maintenance_seconds = time.perf_counter() - maintenance_began
     report["storage"] = {"before_publication": baseline_storage, "before_maintenance": before,
                          "after_maintenance": _sqlite_stats(store.database)}
-    report["metrics"] = {"setup_seconds": setup_seconds, "elapsed_seconds": elapsed, "parent_cpu_seconds": _delta(parent_cpu, parent_after),
-                         "child_cpu_seconds": _delta(child_cpu, child_after), "subprocesses": 0}
+    report["metrics"] = {"setup_seconds": setup_seconds, "flush_seconds": flush_seconds,
+                         "elapsed_seconds": elapsed, "maintenance_seconds": maintenance_seconds,
+                         "parent_cpu_seconds": _delta(parent_cpu, parent_after),
+                         "child_cpu_seconds": _delta(child_cpu, child_after), "subprocesses": 0,
+                         "cpu_accounting": "rusage" if os.name != "nt" else "unavailable",
+                         "flush_barrier": "file-and-directory-fsync" if os.name != "nt" else "unavailable"}
+    report["seed_durability"] = durability
     return decisions, report
 
 
@@ -305,6 +391,14 @@ def _git_publish(prepared: Prepared, target: Path, batch: int) -> tuple[list[dic
     current = dict(prepared.git_initial)
     current[prepared.control_path] = prepared.control_after_blob
     parent = prepared.git_background
+    effective = {key: _git(repo, "config", "--get", key).stdout.decode().strip()
+                 for key in ("core.fsync", "core.fsyncMethod", "fastimport.unpackLimit", "gc.auto")}
+    if effective != {"core.fsync": "all", "core.fsyncMethod": "fsync",
+                     "fastimport.unpackLimit": "1", "gc.auto": "0"}:
+        raise RuntimeError("Git effective config differs from benchmark contract: " + repr(effective))
+    if _git(repo, "rev-parse", "--show-object-format").stdout.strip() != b"sha1":
+        raise RuntimeError("wide-tree benchmark requires SHA-1 Git objects")
+    flush_seconds = _flush_tree(target)
     setup_seconds = time.perf_counter() - setup_began
     baseline_storage = _git_storage(repo)
     parent_cpu, child_cpu = _cpu()
@@ -312,13 +406,8 @@ def _git_publish(prepared: Prepared, target: Path, batch: int) -> tuple[list[dic
     decisions: list[dict[str, Any]] = []
     processes = 0
     for batch_index, group in enumerate(_chunks(prepared.proposals, batch)):
-        accepted = [item for item in group if all(current.get(path) == expected
-                                                   for path, expected in item.git_expected.items())]
-        for item in group:
-            decisions.append({"proposal": item.number, "accepted": item in accepted,
-                              "status": "landed" if item in accepted else "conflict",
-                              "git_audit_blob": item.git_audit_blob,
-                              "audit": item.audit.decode()})
+        accepted, batch_decisions = _select_accepted(group, current)
+        decisions.extend(batch_decisions)
         marks = target / f"marks-{batch_index}.txt"
         stream = b""
         previous = parent
@@ -327,7 +416,6 @@ def _git_publish(prepared: Prepared, target: Path, batch: int) -> tuple[list[dic
             stream += b"commit refs/bench/staging\nmark :" + str(mark).encode() + b"\n"
             stream += _commit("", previous, item.audit, [(item.path, item.git_blob)])[len(b"commit \n"):]
             previous = ":" + str(mark)
-            current[item.path] = item.git_blob
             mark += 1
         if accepted:
             stream += b"reset refs/heads/main\nfrom " + previous.encode() + b"\n\n"
@@ -340,13 +428,20 @@ def _git_publish(prepared: Prepared, target: Path, batch: int) -> tuple[list[dic
     parent_after, child_after = _cpu()
     report = _verify_git(prepared, repo, decisions, parent)
     before = _git_storage(repo)
+    maintenance_began = time.perf_counter()
     _git(repo, "gc", "--prune=now")
+    maintenance_seconds = time.perf_counter() - maintenance_began
     _verify_pending_git_objects(repo, prepared.proposals)
     report["storage"] = {"before_publication": baseline_storage, "before_maintenance": before,
                          "after_maintenance": _git_storage(repo),
                          "new_reachable_tree_bytes": _new_tree_bytes(repo, prepared.git_background, parent)}
-    report["metrics"] = {"setup_seconds": setup_seconds, "elapsed_seconds": elapsed, "parent_cpu_seconds": _delta(parent_cpu, parent_after),
-                         "child_cpu_seconds": _delta(child_cpu, child_after), "subprocesses": processes}
+    report["metrics"] = {"setup_seconds": setup_seconds, "flush_seconds": flush_seconds,
+                         "elapsed_seconds": elapsed, "maintenance_seconds": maintenance_seconds,
+                         "parent_cpu_seconds": _delta(parent_cpu, parent_after),
+                         "child_cpu_seconds": _delta(child_cpu, child_after), "subprocesses": processes,
+                         "cpu_accounting": "rusage" if os.name != "nt" else "unavailable",
+                         "flush_barrier": "file-and-directory-fsync" if os.name != "nt" else "unavailable"}
+    report["git_effective_config"] = effective
     return decisions, report
 
 
@@ -418,9 +513,6 @@ def _verify_git(prepared: Prepared, repo: Path, decisions: list[dict[str, Any]],
     expected_payload = _expected(prepared, decisions)
     expected = {path: _git_blob_id(payload) for path, payload in expected_payload.items()}
     by_number = {item.number: item for item in prepared.proposals}
-    for decision in decisions:
-        if decision["accepted"]:
-            item = by_number[decision["proposal"]]
     tree = _tree(repo, head)
     if tree != expected:
         raise AssertionError("Git final tree differs from oracle")
@@ -434,11 +526,13 @@ def _verify_git(prepared: Prepared, repo: Path, decisions: list[dict[str, Any]],
         message = _git(repo, "cat-file", "-p", identifier.decode()).stdout.partition(b"\n\n")[2]
         if parent != previous or message != proposal.audit:
             raise AssertionError("Git commit lineage or audit differs from prepared proposal")
+        if _git(repo, "cat-file", "-p", f"{identifier.decode()}:{proposal.path}").stdout != proposal.payload:
+            raise AssertionError("Git accepted commit lacks its published content")
         previous = identifier
     rejected = prepared.proposals[0]
     if _git(repo, "cat-file", "-p", rejected.git_audit_blob).stdout != rejected.audit:
         raise AssertionError("Git rejected proposal audit blob was not preserved")
-    if (repo / "refs" / "bench" / "staging").exists():
+    if _git(repo, "show-ref", "--verify", "--quiet", "refs/bench/staging", check=False).returncode == 0:
         raise AssertionError("fast-import staging ref remained visible")
     return {"final_digest": _content_digest(expected_payload),
             "accepted": sum(item["accepted"] for item in decisions), "history": len(entries)}
@@ -495,6 +589,8 @@ def _quartiles(values: list[float]) -> dict[str, float]:
 def run(*, widths: list[int], batches: list[int], repeats: int, proposals: int,
         temporary_parent: Path | None = None) -> dict[str, Any]:
     _validate(widths, batches, repeats, proposals)
+    git_version, _ = _git_version()
+    source = _source_metadata()
     parent = (temporary_parent or TMP).resolve()
     parent.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
@@ -503,6 +599,7 @@ def run(*, widths: list[int], batches: list[int], repeats: int, proposals: int,
         root = Path(directory)
         layouts = [("flat", width) for width in widths] + [("sharded", max(widths))]
         for layout_index, (layout, width) in enumerate(layouts):
+            print(f"[wide-tree] prepare layout={layout} width={width}", file=sys.stderr, flush=True)
             began = time.perf_counter()
             prepared = prepare(root / f"prepared-{layout}-{width}", width, layout, proposals)
             preparation.append({"layout": layout, "width": width,
@@ -511,6 +608,9 @@ def run(*, widths: list[int], batches: list[int], repeats: int, proposals: int,
                 for repeat in range(repeats):
                     order = ("seed", "git") if (layout_index + repeat) % 2 == 0 else ("git", "seed")
                     for backend in order:
+                        print(f"[wide-tree] layout={layout} width={width} batch={batch} "
+                              f"repeat={repeat + 1}/{repeats} backend={backend}",
+                              file=sys.stderr, flush=True)
                         target = root / f"{layout}-{width}-{batch}-{repeat}-{backend}"
                         target.mkdir()
                         decisions, details = (_seed_publish(prepared, target, batch)
@@ -523,9 +623,10 @@ def run(*, widths: list[int], batches: list[int], repeats: int, proposals: int,
         key = f"{row['layout']}/{row['width']}/batch-{row['batch']}/{row['backend']}"
         summary.setdefault(key, []).append(row["metrics"]["elapsed_seconds"])
     return {"format": FORMAT, "environment": {"platform": platform.platform(),
-            "python": sys.version, "sqlite": sqlite3.sqlite_version,
-            "git": _git(ROOT, "--version").stdout.decode().strip(),
-            "seed_durability": {"journal_mode": "wal", "synchronous": "full"},
+            "python": sys.version, "sqlite": sqlite3.sqlite_version, "git": git_version,
+            "source": source, "cpu_count": os.cpu_count(),
+            "processor": platform.processor() or None,
+            "temporary_filesystem": {"root": parent.anchor, "os_name": os.name},
             "git_durability": {"core.fsync": "all", "core.fsyncMethod": "fsync",
                                "hooks": "disabled", "signing": "disabled", "object_format": "sha1"}},
             "configuration": {"widths": widths, "batches": batches,
