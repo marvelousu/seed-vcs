@@ -1,0 +1,43 @@
+name: Wide-tree publication measurement
+
+on:
+  push:
+    paths:
+      - wide_tree_benchmark.py
+      - test_wide_tree_benchmark.py
+      - test_wide_tree_contracts.py
+      - seed.py
+      - .github/workflows/wide-tree.yml
+  pull_request:
+    paths:
+      - wide_tree_benchmark.py
+      - test_wide_tree_benchmark.py
+      - test_wide_tree_contracts.py
+      - seed.py
+      - .github/workflows/wide-tree.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Verify benchmark contracts
+        run: python -m unittest -v test_wide_tree_benchmark test_wide_tree_contracts
+      - name: Measure complete predeclared matrix
+        run: python wide_tree_benchmark.py --widths 128 4096 32768 --batches 1 8 32 --repeats 7 --proposals 32 --output artifacts/wide-tree.json
+      - name: Preserve raw measurements
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wide-tree-${{ github.sha }}
+          path: artifacts/wide-tree.json
+          if-no-files-found: error

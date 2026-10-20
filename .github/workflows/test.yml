@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Run behavioral tests
-        run: python -m unittest -v test_seed.py test_predicates.py test_backup.BackupTests test_git.py test_comparison.py test_workflow_environment.py
+        run: python -m unittest -v test_seed.py test_predicates.py test_backup.BackupTests test_git.py test_comparison.py test_workflow_environment.py test_wide_tree_benchmark.py test_wide_tree_contracts.py
       - name: Run two-agent demonstration
         run: python demo.py
       - name: Install service dependencies
