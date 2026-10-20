@@ -1,3 +1,4 @@
 include demo.py test_*.py
 recursive-include docs *.md *.json.gz
 recursive-include examples *.json
+recursive-include experiments *.py
