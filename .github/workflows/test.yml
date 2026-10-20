@@ -33,7 +33,7 @@ jobs:
       - name: Run HTTP and agent session contracts
         run: python -m unittest -v test_service.ServiceTests test_session.py test_agent.py test_validation.ValidationTests
       - name: Check live-study fixtures and controllers without model calls
-        run: python -B -m unittest -v experiments.live_agent.test_taskpack experiments.live_agent.test_claude_adapter experiments.live_agent.test_run_study
+        run: python -B -m unittest -v experiments.live_agent.test_taskpack experiments.live_agent.test_claude_adapter experiments.live_agent.test_export_results experiments.live_agent.test_run_study
       - name: Compare deterministic integration workflows
         run: python workflow_benchmark.py --output artifacts/workflow-replay.json
       - name: Replay captured coding samples across three backends

@@ -466,4 +466,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         report = run(output=args.output, python=args.python, adapter=args.adapter.resolve(), timeout=args.timeout,
                      max_turns=args.max_turns, dry_run=args.dry_run)
-    except (OSError, ValueError, RuntimeError
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    _checkpoint(args.output, report)
+    return 1 if report["failures"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
