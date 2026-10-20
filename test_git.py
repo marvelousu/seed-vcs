@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from seed import SeedError, Store
+import seed_git
 from seed_git import export_seed_revision, import_git_commit
 
 
@@ -123,6 +124,51 @@ class GitBridgeTests(unittest.TestCase):
         self.assertEqual(parents[1:], [first["commit"]])
         self.assertEqual(git(self.destination, "show", second["commit"] + ":next.txt"), b"next\n")
         self.assertEqual(git(self.destination, "show", second["commit"] + ":binary.bin", check=False), b"")
+
+    def test_existing_export_rejects_tampered_tree_with_matching_trailer(self):
+        revision = import_git_commit(self.store, self.source, self.commit)["revision"]
+        export_seed_revision(self.store, self.destination, revision, branch="seed/tampered")
+        (self.destination / "tampered.txt").write_text("not Seed content\n", encoding="utf-8")
+        tampered = commit_all(
+            self.destination,
+            "Export Seed revision\n\nSeed-Revision: " + revision,
+        )
+        git(self.destination, "update-ref", "refs/heads/seed/tampered", tampered)
+        git(self.destination, "update-ref", "refs/seed/exports/" + revision, tampered)
+        with self.assertRaisesRegex(SeedError, "tree does not match"):
+            export_seed_revision(self.store, self.destination, revision, branch="seed/tampered")
+
+    def test_import_limits_before_reading_blob_payloads(self):
+        def blob_reads(calls):
+            return [
+                call for call in calls
+                if len(call.args) > 1 and call.args[1][:2] == ["cat-file", "blob"]
+            ]
+
+        with self.subTest("file count"):
+            store = Store.create(self.root / "limit-count.db")
+            with (patch.object(seed_git, "MAX_IMPORT_FILES", 2),
+                  patch.object(seed_git, "_git", wraps=seed_git._git) as command,
+                  self.assertRaisesRegex(SeedError, "limited to 2 files")):
+                import_git_commit(store, self.source, self.commit)
+            self.assertFalse(blob_reads(command.call_args_list))
+
+        with self.subTest("per blob"):
+            store = Store.create(self.root / "limit-blob.db")
+            with (patch.object(seed_git, "MAX_IMPORT_BLOB_BYTES", 2),
+                  patch.object(seed_git, "_git", wraps=seed_git._git) as command,
+                  self.assertRaisesRegex(SeedError, "blob exceeds 2 bytes")):
+                import_git_commit(store, self.source, self.commit)
+            self.assertFalse(blob_reads(command.call_args_list))
+
+        with self.subTest("total"):
+            store = Store.create(self.root / "limit-total.db")
+            with (patch.object(seed_git, "MAX_IMPORT_BLOB_BYTES", 100),
+                  patch.object(seed_git, "MAX_IMPORT_TOTAL_BYTES", 2),
+                  patch.object(seed_git, "_git", wraps=seed_git._git) as command,
+                  self.assertRaisesRegex(SeedError, "exceeds 2 bytes")):
+                import_git_commit(store, self.source, self.commit)
+            self.assertFalse(blob_reads(command.call_args_list))
 
     def test_unsupported_git_modes_are_rejected_before_seed_changes(self):
         for mode, payload, path in (

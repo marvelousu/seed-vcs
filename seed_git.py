@@ -24,6 +24,9 @@ _GIT_HEX = re.compile(r"[0-9a-fA-F]{4,64}\Z")
 _SEED_ID = re.compile(r"[0-9a-f]{64}\Z")
 _IMPORT_TRAILER = "Seed-Git-Import: "
 _EXPORT_TRAILER = "Seed-Revision: "
+MAX_IMPORT_FILES = 1_000
+MAX_IMPORT_BLOB_BYTES = 1 * 1024 * 1024
+MAX_IMPORT_TOTAL_BYTES = 8 * 1024 * 1024
 _GIT_SAFE_OPTIONS = (
     "-c", f"core.hooksPath={os.devnull}",
     "-c", "commit.gpgsign=false",
@@ -116,7 +119,8 @@ def _git_commit_files(git_root: str | Path, commit: str) -> dict[str, bytes]:
     """Read a recursive Git tree without treating file names as command text."""
     raw = _git(git_root, ["ls-tree", "-rz", "--full-tree", commit])
     assert raw is not None
-    files: dict[str, bytes] = {}
+    entries: list[tuple[str, str]] = []
+    paths: set[str] = set()
     for record in raw.split(b"\0"):
         if not record:
             continue
@@ -139,15 +143,34 @@ def _git_commit_files(git_root: str | Path, commit: str) -> dict[str, bytes]:
         except UnicodeDecodeError as exc:
             raise SeedError("Git import requires UTF-8 file names") from exc
         file_path(path)
-        if path in files:
+        if path in paths:
             raise SeedError("Git tree contains duplicate paths")
-        payload = _git(git_root, ["cat-file", "blob", identifier_text])
-        assert payload is not None
-        files[path] = payload
-    if not files:
+        paths.add(path)
+        entries.append((path, identifier_text))
+        if len(entries) > MAX_IMPORT_FILES:
+            raise SeedError(f"Git import is limited to {MAX_IMPORT_FILES} files per Seed proposal")
+    if not entries:
         raise SeedError("An empty Git commit cannot be represented by a Seed proposal")
-    if len(files) > 1000:
-        raise SeedError("Git import is limited to 1000 files per Seed proposal")
+    total = 0
+    for _, identifier in entries:
+        size_text = _git_text(git_root, ["cat-file", "-s", identifier])
+        if size_text is None or not size_text.isascii() or not size_text.isdecimal():
+            raise SeedError("Git returned an invalid blob size")
+        size = int(size_text)
+        if size > MAX_IMPORT_BLOB_BYTES:
+            raise SeedError(f"Git import blob exceeds {MAX_IMPORT_BLOB_BYTES} bytes")
+        total += size
+        if total > MAX_IMPORT_TOTAL_BYTES:
+            raise SeedError(f"Git import exceeds {MAX_IMPORT_TOTAL_BYTES} bytes")
+    files: dict[str, bytes] = {}
+    for path, identifier in entries:
+        payload = _git(git_root, ["cat-file", "blob", identifier])
+        assert payload is not None
+        # The content-addressed object cannot legitimately change after its
+        # size query; this also keeps a malformed Git response bounded.
+        if len(payload) > MAX_IMPORT_BLOB_BYTES:
+            raise SeedError(f"Git import blob exceeds {MAX_IMPORT_BLOB_BYTES} bytes")
+        files[path] = payload
     return dict(sorted(files.items()))
 
 
@@ -309,6 +332,13 @@ def _exported_revision(git_root: str | Path, commit: str) -> str | None:
     return None
 
 
+def _commit_tree(git_root: str | Path, commit: str) -> str:
+    tree = _git_text(git_root, ["rev-parse", "--verify", "--end-of-options", commit + "^{tree}"])
+    if tree is None or not _GIT_HEX.fullmatch(tree):
+        raise SeedError("Git export commit has an invalid tree")
+    return tree.lower()
+
+
 def _is_ancestor(git_root: str | Path, ancestor: str, descendant: str) -> bool:
     return _git(
         git_root,
@@ -441,6 +471,9 @@ def export_seed_revision(seed: Any, git_root: str | Path, revision: str,
         raise SeedError("Seed export branch is checked out in a worktree")
     existing = _find_export(git_root, branch_ref, revision)
     if existing is not None:
+        expected_tree = _write_tree(git_root, _seed_manifest(seed, revision))
+        if _commit_tree(git_root, existing) != expected_tree:
+            raise SeedError("Existing Seed export tree does not match the requested revision")
         mapping_ref = "refs/seed/exports/" + revision
         mapping = _read_ref(git_root, mapping_ref)
         if mapping is None:

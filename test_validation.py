@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 from seed import Conflict, SeedError, object_id
 from seed_validation import configuration_id, run_validation
@@ -161,10 +162,11 @@ class ValidationTests(unittest.TestCase):
     def test_modifying_versioned_inputs_during_test_is_not_a_pass(self):
         validator, operator = self.clients()
         base = self.commit({"input.txt": b"original"})
-        command = [sys.executable, "-c", "from pathlib import Path; Path('input.txt').write_text('changed')"]
-        result = run_validation(validator, kind="revision", subject=base,
-                                workspace=str(self.root / "mutated-work"), command=command,
-                                environment="test-environment-v1")
+        command = [sys.executable, "-c", "import os; from pathlib import Path; assert 'SEED_TOKEN' not in os.environ; Path('input.txt').write_text('changed')"]
+        with patch.dict(os.environ, {"SEED_TOKEN": self.validator}):
+            result = run_validation(validator, kind="revision", subject=base,
+                                    workspace=str(self.root / "mutated-work"), command=command,
+                                    environment="test-environment-v1")
         self.assertEqual(result["result"]["returncode"], 0)
         self.assertEqual(result["modified_inputs"], ["input.txt"])
         self.assertFalse(result["validation"]["report"]["passed"])

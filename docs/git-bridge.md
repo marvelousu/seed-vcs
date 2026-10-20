@@ -26,8 +26,9 @@ python seed_git.py --url https://seed.example --repo example import `
 
 Only regular `100644` files with UTF-8 paths are supported. Imports reject
 executable files, symlinks, submodules, empty trees, invalid paths, and trees
-larger than 1,000 files. This keeps the imported representation within Seed's
-ordinary file model.
+larger than 1,000 files. Each blob is limited to 1 MiB and the imported tree
+to 8 MiB. Git object sizes are checked before any blob bytes are read. This
+keeps the imported representation within Seed's ordinary file model.
 
 Export writes one pinned Seed revision to a dedicated Git branch whose name
 starts with `seed/`. The branch is updated with Git plumbing only; the bridge
@@ -42,9 +43,10 @@ python seed_git.py --db .\seed.db export --git D:\work\destination `
 An export commit includes a `Seed-Revision` trailer. The bridge records a
 private `refs/seed/exports/<seed-revision>` mapping and checks the branch
 lineage before advancing it. A retry after interruption between the branch
-update and mapping update finds the trailer and restores the mapping. Existing
-non-Seed branches, unrelated `seed/` branches, symbolic refs, and divergent
-lineages are rejected instead of being overwritten.
+update and mapping update finds the trailer, verifies its tree against the
+requested Seed revision, and restores the mapping. Existing non-Seed branches,
+unrelated `seed/` branches, symbolic refs, divergent lineages, and a matching
+trailer with different contents are rejected instead of being overwritten.
 
 Git is invoked with argument lists, never through a shell. The bridge removes
 inherited `GIT_*` environment variables, disables global/system Git

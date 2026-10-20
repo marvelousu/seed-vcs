@@ -18,7 +18,6 @@ from seed import Conflict, SeedError, canonical, object_id
 
 
 ID = re.compile(r"[0-9a-f]{64}\Z")
-MAX_FILES = 10_000
 
 
 def identifier(value):

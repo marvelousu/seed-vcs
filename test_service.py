@@ -410,6 +410,21 @@ class ServiceTests(unittest.TestCase):
 class PostgresServiceTests(ServiceTests):
     dsn = os.environ.get("SEED_TEST_DATABASE_URL", "")
 
+    def test_same_length_corruption_is_rejected_before_proposal_or_landing(self):
+        head = self.client.head()
+        blob = self.client.upload(b"good")
+        proposal = self.client.propose(head, {"value": b"good"})
+        store = self.app.state.provider.repository(self.repo)
+        store.objects.path(blob).write_bytes(b"evil")
+        with self.assertRaisesRegex(SeedError, "Damaged blob"):
+            self.client.land(proposal)
+        self.assertEqual(self.client.head(), head)
+        self.assertEqual(self.client.status(proposal)["status"], "pending")
+        with self.assertRaisesRegex(SeedError, "Damaged blob"):
+            self.client._request("POST", "/proposals", {
+                "base": head, "writes": {"other": blob}, "reads": []})
+        self.assertEqual(self.client.head(), head)
+
 
 if __name__ == "__main__":
     unittest.main()

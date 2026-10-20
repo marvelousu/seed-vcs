@@ -31,6 +31,11 @@ BACKENDS = ("seed", "git-worktree", "git-conditional-worktree")
 MAX_TRACE_BYTES = 4 * 1024 * 1024
 MAX_FILES = 1_000
 MAX_FILE_BYTES = 1 * 1024 * 1024
+_WINDOWS_RESERVED_BASENAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
 
 
 class TraceError(ValueError):
@@ -80,6 +85,26 @@ def _encode_payload(payload: bytes) -> dict[str, str]:
         return {"encoding": "base64", "data": base64.b64encode(payload).decode("ascii")}
 
 
+def _portable_path(value: str) -> str:
+    """Validate a Seed path that will also be materialized on Windows.
+
+    Seed's logical namespace intentionally permits some names which cannot be
+    represented safely and consistently by a local worktree (for example
+    ``name:stream``).  Comparison traces are portable worktree input, so their
+    stricter namespace is deliberate.
+    """
+    try:
+        path = file_path(value)
+    except SeedError as exc:
+        raise TraceError(f"Not a portable trace path: {value!r}") from exc
+    for part in path.split("/"):
+        if (part.endswith((" ", "."))
+                or any(ord(character) < 32 or character in '<>:"\\|?*' for character in part)
+                or part.split(".", 1)[0].upper() in _WINDOWS_RESERVED_BASENAMES):
+            raise TraceError(f"Not a portable trace path: {value!r}")
+    return path
+
+
 def _paths(value: Any, field: str, *, allow_delete: bool) -> dict[str, bytes | None]:
     if not isinstance(value, dict) or len(value) > MAX_FILES:
         raise TraceError(f"{field} must be an object with at most {MAX_FILES} paths")
@@ -87,7 +112,7 @@ def _paths(value: Any, field: str, *, allow_delete: bool) -> dict[str, bytes | N
     for path, encoded in value.items():
         if not isinstance(path, str):
             raise TraceError(f"{field} paths must be strings")
-        path = file_path(path)
+        path = _portable_path(path)
         if encoded is None and allow_delete:
             result[path] = None
             continue
@@ -110,7 +135,7 @@ def _ranges(value: Any) -> tuple[tuple[str, str], ...]:
         kind, prefix = entry["kind"], entry["prefix"]
         if kind not in {"membership", "subtree"} or not isinstance(prefix, str):
             raise TraceError("Invalid observed range")
-        prefix = "" if not prefix else file_path(prefix.rstrip("/")) + "/"
+        prefix = "" if not prefix else _portable_path(prefix.rstrip("/")) + "/"
         result.add((kind, prefix))
     return tuple(sorted(result))
 
@@ -196,7 +221,7 @@ def parse_trace(raw: Any, *, source: str = "<trace>", allow_fixture: bool = Fals
         reads = observed["reads"]
         if not isinstance(reads, list) or len(reads) > 1_000 or not all(isinstance(path, str) for path in reads):
             raise TraceError(f"{source}: observed.reads must be a bounded string list")
-        normalized_reads = tuple(sorted({file_path(path) for path in reads}))
+        normalized_reads = tuple(sorted({_portable_path(path) for path in reads}))
         rework = agent["rework"]
         if not isinstance(rework, list) or len(rework) > 100 or not all(isinstance(event, dict) for event in rework):
             raise TraceError(f"{source}: agent.rework must be a bounded list of objects")
@@ -238,8 +263,33 @@ def load_traces(paths: Iterable[Path], *, allow_fixture: bool = False, max_trace
 
 
 def _write(root: Path, changes: dict[str, bytes | None]) -> None:
+    """Apply already-validated trace data without escaping ``root``.
+
+    Revalidate here because this helper is also the last boundary before a
+    filesystem mutation.  All targets are resolved first, so one malicious
+    path cannot leave an earlier change partially materialized.
+    """
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError as exc:
+        raise TraceError(f"Cannot resolve materialization root {root}: {exc}") from exc
+    if not resolved_root.is_dir():
+        raise TraceError(f"Materialization root is not a directory: {root}")
+
+    targets: list[tuple[Path, bytes | None]] = []
     for path, payload in changes.items():
-        target = root / path
+        if payload is not None and not isinstance(payload, bytes):
+            raise TraceError(f"Materialized payload for {path!r} must be bytes or null")
+        portable_path = _portable_path(path)
+        try:
+            target = resolved_root.joinpath(*portable_path.split("/")).resolve(strict=False)
+        except OSError as exc:
+            raise TraceError(f"Cannot resolve materialized path {path!r}: {exc}") from exc
+        if not target.is_relative_to(resolved_root):
+            raise TraceError(f"Materialized path escapes its root: {path!r}")
+        targets.append((target, payload))
+
+    for target, payload in targets:
         if payload is None:
             if target.exists():
                 target.unlink()
@@ -261,7 +311,11 @@ def observations_match(workload: Workload) -> bool:
             current.pop(path, None)
         else:
             current[path] = payload
-    if any(workload.initial.get(path) != current.get(path) for path in workload.reads):
+    # Store._freeze captures expected objects for every effective write as well
+    # as explicit reads.  Conditional Git must therefore reject a changed
+    # output path even when a recorder did not list it among its reads.
+    observed_paths = set(workload.edits) | set(workload.reads)
+    if any(workload.initial.get(path) != current.get(path) for path in observed_paths):
         return False
     return all(
         _range_fingerprint(workload.initial, kind, prefix) == _range_fingerprint(current, kind, prefix)

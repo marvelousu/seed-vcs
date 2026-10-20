@@ -235,6 +235,8 @@ class PostgresStore(Store):
                     raise SeedError("Missing blob: " + identifier) from exc
                 if size != rows[identifier]:
                     raise SeedError("Damaged blob: " + identifier)
+                # Same-length corruption must not become part of a new revision.
+                self.objects.read(identifier)
 
     def _blob(self, db, identifier):
         self._verify_blob(db, identifier)

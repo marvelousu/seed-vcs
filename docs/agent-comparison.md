@@ -46,6 +46,13 @@ the recorded read/range observations: observations are what the agent captured,
 not a safety judgment. Inputs are bounded to 1,000 files, 1 MiB per payload,
 and 4 MiB per trace by default.
 
+Trace file paths use a portable worktree namespace. Drive-qualified paths,
+colons (including Windows alternate data streams), device names, control
+characters, and Windows-reserved punctuation are rejected even if Seed's
+logical object namespace could represent them. Before materializing a trace,
+the runner resolves every target and verifies it remains below its newly
+created replay directory; it validates all targets before changing any file.
+
 The result records accepts, unsafe accepts, conservative rejections, captured
 reads/ranges, recorded rework count, replay rework-required count, phase time,
 and available transport data. Seed uses the in-process store in this first

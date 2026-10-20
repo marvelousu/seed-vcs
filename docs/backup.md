@@ -12,6 +12,13 @@ content-addressed files under `blobs/`. The manifest preserves all repository
 metadata, including `candidate:*`, `validation:*`, `deployable`, and `verified`
 records when present. It contains no HTTP credentials or server auth data.
 
+Archives are trusted operational snapshots. Restoring one has database-admin
+authority over a fresh destination. Verification establishes archive integrity
+and self-consistency only: it does not authenticate the archive's origin or
+give preserved workflow attestations and pointers validator provenance.
+Restoring an archive does not install HTTP credentials or server authentication
+configuration.
+
 Create and verify an SQLite archive:
 
 ```sh

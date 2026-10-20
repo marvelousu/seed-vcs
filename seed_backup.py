@@ -435,7 +435,11 @@ def _fresh_target(store: Store, db) -> None:
 
 
 def restore(store: Store, path: str | Path) -> dict[str, Any]:
-    """Restore a verified archive into a fresh Store of the same backend family."""
+    """Restore a verified, trusted operational archive into a fresh Store.
+
+    Verification proves archive integrity and self-consistency, not its origin
+    or the provenance of preserved workflow attestations and pointers.
+    """
     root = _archive_root(path)
     payload = _regular_file(root / "manifest.json", maximum=MAX_MANIFEST_BYTES)
     try:

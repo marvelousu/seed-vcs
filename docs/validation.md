@@ -53,7 +53,7 @@ manifest and verified blob bytes. The worker uses the same local runner as
 versioned inputs make validation fail even if the command exits zero; new build
 outputs can remain in the local workspace. The result records the exact tree,
 command/environment configuration, exit status, elapsed time and a log digest.
-The environment credential is removed from the command environment.
+`SEED_TOKEN` is removed from the command environment.
 
 The worker runs with local privileges. External inputs need to be represented
 by the environment identity and controlled by that worker. The current bounded
@@ -95,3 +95,5 @@ advance. Multiple proposals in one candidate publish atomically.
 Workflow records use namespaced metadata entries and are included in logical
 repository backups. They contain hashes and attestations rather than bearer
 credentials or complete command transcripts.
+
+A repeated publication returns `already-landed` with the same candidate and revision identifiers. Eligibility is rechecked for new publication and promotion decisions; stored target records preserve the last selected revision even when the current policy or a later failed validation makes it ineligible.

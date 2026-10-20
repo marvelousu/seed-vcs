@@ -77,6 +77,41 @@ class ComparisonTests(unittest.TestCase):
         self.assertFalse(changed.expected_safe)
         self.assertEqual(changed.oracle_reason, "The output depends on the changed input price.")
 
+    def test_conditional_observes_written_paths_even_when_they_were_not_read(self):
+        trace = fixture_trace()
+        independent = trace["workloads"][0]
+        independent["background"] = {"src/a.py": payload("background changed output\n")}
+        independent["agent"]["proposal"]["observed"]["reads"] = []
+        workload = comparison.parse_trace(trace, allow_fixture=True)[0]
+
+        # Seed freezes expected state for writes as well as explicit reads.
+        # Conditional Git must reject the same stale candidate.
+        self.assertEqual(workload.reads, ())
+        self.assertFalse(comparison.observations_match(workload))
+
+    def test_materialization_rejects_windows_paths_before_touching_outside_files(self):
+        parent = Path("artifacts/tmp").resolve()
+        parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=parent) as temporary:
+            base = Path(temporary)
+            root = base / "worktree"
+            root.mkdir()
+            sentinel = base / "outside-sentinel.txt"
+            sentinel.write_text("unchanged", encoding="utf-8")
+
+            # The absolute form exercises drive paths on Windows.  C:/ is also
+            # rejected on POSIX so traces have one portable namespace.
+            for unsafe_path in (sentinel.as_posix(), "C:/outside.txt", "nested/item:stream"):
+                with self.assertRaises(comparison.TraceError):
+                    comparison._write(root, {"safe.txt": b"must not appear", unsafe_path: b"blocked"})
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+                self.assertFalse((root / "safe.txt").exists())
+
+            trace = fixture_trace()
+            trace["workloads"][0]["initial"] = {"C:/outside.txt": payload("blocked")}
+            with self.assertRaises(comparison.TraceError):
+                comparison.parse_trace(trace, allow_fixture=True)
+
     def test_paired_run_records_each_backend_and_oracle_outcomes(self):
         workloads = comparison.parse_trace(fixture_trace(), allow_fixture=True)
 
