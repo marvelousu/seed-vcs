@@ -46,8 +46,10 @@ revision. Batch landing amortizes lock acquisition and durable commit overhead.
 
 The local task adapter materializes scoped regular-file workspaces;
 the core service publishes file states. The Git bridge handles explicit one-way
-snapshot import and revision export. Line-based merging and simultaneous
-two-way synchronization remain separate design work.
+snapshot import and revision export. Landing never merges file contents;
+`seed-agent rework --carry` merges line by line in the client and submits the
+result as a new proposal. Simultaneous two-way synchronization with Git remains
+separate design work.
 
 The following details matter when evaluating it:
 
@@ -56,8 +58,11 @@ The following details matter when evaluating it:
   conservative subtree condition. Arbitrary shell and external inputs need
   explicit handling. Test and review the combined program separately.
 - **Conflicts are conservative.** Different edits to the same file conflict,
-  including edits to unrelated lines. Conditions compare current contents; a
-  file that changed from A to B and back to A matches an A condition.
+  including edits to unrelated lines. After such a refusal,
+  `seed-agent rework --carry` can combine edits whose changed regions are
+  separated by at least one unchanged line. Conditions compare current
+  contents; a file that changed from A to B and back to A matches an A
+  condition.
 - **No-op writes are omitted.** Their implicit conditions are omitted too. Use
   `reads` to retain a condition on such a path. Proposals with no effective
   writes are rejected.

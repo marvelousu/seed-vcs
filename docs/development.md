@@ -5,7 +5,7 @@
 Run the behavioral suite and demo from the repository directory:
 
 ```sh
-python -m unittest -v test_seed.py test_predicates.py test_backup.BackupTests test_git.py test_comparison.py test_workflow_environment.py
+python -m unittest -v test_seed.py test_predicates.py test_backup.BackupTests test_git.py test_comparison.py test_workflow_environment.py test_merge.py
 python demo.py
 ```
 
