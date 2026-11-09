@@ -78,9 +78,21 @@ seed-agent --url http://127.0.0.1:7331 --repo demo --state artifacts/task.json r
 ```
 
 Rework starts at the current head and links the eventual new proposal to the old
-one through `supersedes`. It deliberately starts with no old edits or reads.
-Read the changed inputs and recreate the appropriate output; merely replacing
-old expected hashes would bypass the conflict which was just detected.
+one through `supersedes`. By default it deliberately starts with no old edits or
+reads. Pass `--carry` to re-apply old writes only: unchanged files are carried,
+non-overlapping text changes are three-way merged, and writes already present at
+the new head are reported without being written again. Reads and ranges are never
+reused blindly: unchanged evidence is retained, while changed evidence is stale.
+Text changes whose regions touch are treated as conflicting. `--carry` reports `add-add`, `delete-modify`,
+`overlapping-changes`, or `binary` conflicts for writes it cannot safely carry.
+
+Carry preserves old reads and ranges whose pinned contents or fingerprints are
+unchanged between bases. It records changed reads and ranges as stale evidence,
+so a carried task cannot be proposed until each stale path has been read again
+and each stale range has been observed again (rerunning `run` with the
+appropriate scope does this naturally). The guard says which inputs to re-read.
+Re-run verification after carry: the old command result described the old
+candidate, not the carried or merged output.
 
 ## Command workspace
 
@@ -111,6 +123,16 @@ executes the command. `SEED_TOKEN` is removed from the child environment.
 Use the runner for code you are willing to execute with your local privileges.
 Its result records the base and edited-state digest, return code and elapsed
 time. It does not label a later combined head as tested.
+
+By default `run --prefix P` records the whole materialized subtree as its
+dependency. Use repeatable `--depends P` to declare narrower subtrees while
+still materializing and collecting edits across `--prefix`; every dependency
+must be that prefix or below it. The command records only those declared
+subtrees, and subsequent runs for the task must use the same dependency set.
+This narrows conservative landing conflicts, but it is not process read tracing:
+if a command reads repository inputs outside `--depends`, declaring them remains
+the caller's responsibility. Edited paths remain protected at their pinned base
+content even when outside a declared dependency.
 
 ## Measure before extending the architecture
 

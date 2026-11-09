@@ -26,6 +26,7 @@ from uuid import uuid4
 
 from seed import Conflict, SeedError, file_path
 from seed_client import Client, Session
+from seed_merge import merge3
 from seed_workspace import collect_workspace_edits, materialize_workspace, workspace_manifest
 
 
@@ -213,7 +214,7 @@ def _validate_state(value: Any) -> None:
     if not isinstance(value, dict) or value.get("format") != TASK_FORMAT:
         raise SeedError("Unsupported task state format")
     required = {"format", "task", "url", "repository", "base", "reads", "ranges", "edits", "proposal", "result", "supersedes", "retries", "metrics"}
-    if set(value) - {"workspace", *required} or not required <= set(value):
+    if set(value) - {"workspace", "carry", *required} or not required <= set(value):
         raise SeedError("Task state has an unsupported schema")
     if not all(isinstance(value[key], str) and value[key] for key in ("task", "url", "repository", "base")):
         raise SeedError("Task state has invalid task binding")
@@ -224,6 +225,33 @@ def _validate_state(value: Any) -> None:
         file_path(path)
     _ranges(value["ranges"])
     _decode_edits(value["edits"])
+    workspace = value.get("workspace")
+    if workspace is not None:
+        if not isinstance(workspace, dict) or set(workspace) - {"workspace", "prefix", "files", "manifest", "depends"} or not {"workspace", "prefix", "files", "manifest"} <= set(workspace):
+            raise SeedError("Task workspace has an unsupported schema")
+        if not isinstance(workspace["workspace"], str) or not isinstance(workspace["prefix"], str) or not isinstance(workspace["manifest"], str) or not isinstance(workspace["files"], int) or workspace["files"] < 0:
+            raise SeedError("Task workspace is invalid")
+        _scope_prefix(workspace["prefix"])
+        if "depends" in workspace:
+            _validate_depends(workspace["depends"], _scope_prefix(workspace["prefix"]))
+    carry = value.get("carry")
+    if carry is not None:
+        if not isinstance(carry, dict) or set(carry) != {"from", "paths", "stale_reads", "stale_ranges"} or not isinstance(carry["from"], str) or not carry["from"] or not isinstance(carry["paths"], dict):
+            raise SeedError("Task carry has an unsupported schema")
+        for path, status in carry["paths"].items():
+            file_path(path)
+            if status not in {"carried", "merged"}:
+                raise SeedError("Task carry paths are invalid")
+        if not isinstance(carry["stale_reads"], list) or carry["stale_reads"] != sorted(set(carry["stale_reads"])):
+            raise SeedError("Task carry stale reads must be a sorted unique list")
+        for path in carry["stale_reads"]:
+            file_path(path)
+        if not isinstance(carry["stale_ranges"], list):
+            raise SeedError("Task carry stale ranges must be a list")
+        encoded = [{"kind": item[0], "prefix": item[1]} for item in carry["stale_ranges"] if isinstance(item, list) and len(item) == 2]
+        if len(encoded) != len(carry["stale_ranges"]) or carry["stale_ranges"] != [[item["kind"], item["prefix"]] for item in encoded] or encoded != sorted(encoded, key=lambda item: (item["kind"], item["prefix"])):
+            raise SeedError("Task carry stale ranges must be sorted [kind, prefix] pairs")
+        _ranges(encoded)
     if value["proposal"] is not None and not isinstance(value["proposal"], str):
         raise SeedError("Task proposal must be a string or null")
     if value["supersedes"] is not None and not isinstance(value["supersedes"], str):
@@ -250,6 +278,18 @@ def _new_state(client: Client, url: str, repository: str, *, supersedes: str | N
         "retries": 0,
         "metrics": [],
     }
+
+
+def _validate_depends(raw: Any, prefix: str) -> list[str]:
+    if not isinstance(raw, list):
+        raise SeedError("Workspace dependencies must be a list")
+    depends = sorted({_scope_prefix(value) for value in raw})
+    if len(depends) != len(raw):
+        raise SeedError("Workspace dependencies must be unique")
+    for dependency in depends:
+        if prefix and dependency != prefix and not dependency.startswith(prefix + "/"):
+            raise SeedError("run --depends must be equal to or beneath --prefix")
+    return depends
 
 
 def _session(client: Client, state: dict[str, Any]) -> Session:
@@ -336,13 +376,21 @@ def _restore_workspace_guard(state: dict[str, Any], session: Session, state_file
     if manifest.get("base") != session.base or not isinstance(manifest.get("prefix"), str):
         raise SeedError("Workspace manifest does not match this task's base revision")
     before_ranges = set(session.ranges)
-    session.track_scope(manifest["prefix"], "subtree")
+    depends = manifest.get("depends")
+    if depends is None:
+        session.track_scope(manifest["prefix"], "subtree")
+    else:
+        depends = _validate_depends(depends, _scope_prefix(manifest["prefix"]))
+        for dependency in depends:
+            session.track_scope(dependency, "subtree")
     workspace = {
         "workspace": manifest["root"],
         "prefix": manifest["prefix"],
         "files": len(manifest.get("base_files", {})),
         "manifest": str(state_file.path.with_name(state_file.path.name + ".workspace.json")),
     }
+    if depends is not None:
+        workspace["depends"] = depends
     changed = state.get("workspace") != workspace
     state["workspace"] = workspace
     _save_session(state, session)
@@ -357,6 +405,83 @@ def _assert_mutable(state: dict[str, Any]) -> None:
 def _assert_no_workspace_mixing(state: dict[str, Any]) -> None:
     if state.get("workspace") is not None:
         raise SeedError("Use the materialized workspace for edits after run has begun")
+
+
+def _same_snapshot(client: Client, kind: str, prefix: str, old_base: str, new_base: str) -> bool:
+    old = client.range_snapshot(prefix, kind, old_base)
+    new = client.range_snapshot(prefix, kind, new_base)
+    if old.get("revision") != old_base or new.get("revision") != new_base:
+        raise SeedError("Range snapshot does not match its requested revision")
+    return old.get("fingerprint") == new.get("fingerprint")
+
+
+def _carry_rework(client: Client, state: dict[str, Any], old_session: Session,
+                  new_state: dict[str, Any]) -> dict[str, Any]:
+    """Apply compatible writes to a replacement task and record stale inputs."""
+    new_session = _session(client, new_state)
+    carried: list[str] = []
+    merged: list[str] = []
+    already_applied: list[str] = []
+    conflicts: list[dict[str, str]] = []
+    old_base = old_session.base
+    new_base = new_session.base
+    for path, edited in sorted(old_session.edits.items()):
+        before = client.read(path, old_base)
+        head = client.read(path, new_base)
+        if head == before:
+            new_session.write(path, edited)
+            carried.append(path)
+        elif head == edited:
+            already_applied.append(path)
+        elif before is None or edited is None or head is None:
+            conflicts.append({"path": path, "reason": "add-add" if before is None else "delete-modify"})
+        else:
+            outcome = merge3(before, head, edited)
+            if outcome.status == "clean":
+                new_session.write(path, outcome.content)
+                merged.append(path)
+            elif outcome.status == "binary":
+                conflicts.append({"path": path, "reason": "binary"})
+            else:
+                conflicts.append({"path": path, "reason": "overlapping-changes"})
+    edited_paths = set(old_session.edits)
+    stale_reads = sorted(path for path in old_session.reads - edited_paths
+                         if client.read(path, old_base) != client.read(path, new_base))
+    kept_reads = sorted(path for path in old_session.reads
+                        if client.read(path, old_base) == client.read(path, new_base))
+    stale_ranges = [[kind, prefix] for kind, prefix in sorted(old_session.ranges)
+                    if not _same_snapshot(client, kind, prefix, old_base, new_base)]
+    kept_ranges = [[kind, prefix] for kind, prefix in sorted(old_session.ranges)
+                   if _same_snapshot(client, kind, prefix, old_base, new_base)]
+    for path in kept_reads:
+        new_session.read_base(path)
+    for kind, prefix in (tuple(item) for item in kept_ranges):
+        new_session.track_scope(prefix, kind)
+    _save_session(new_state, new_session)
+    new_state["carry"] = {
+        "from": state["proposal"],
+        "paths": {path: "carried" for path in carried} | {path: "merged" for path in merged},
+        "stale_reads": stale_reads,
+        "stale_ranges": stale_ranges,
+    }
+    return {"carried": carried, "merged": merged, "already_applied": already_applied,
+            "conflicts": conflicts, "stale_reads": stale_reads, "stale_ranges": stale_ranges,
+            "kept_reads": kept_reads, "kept_ranges": kept_ranges}
+
+
+def _assert_carry_revalidated(state: dict[str, Any], session: Session) -> None:
+    carry = state.get("carry")
+    if carry is None:
+        return
+    missing_reads = sorted(set(carry["stale_reads"]) - session.reads)
+    missing_ranges = sorted({(item[0], item[1]) for item in carry["stale_ranges"]} - session.ranges)
+    if missing_reads or missing_ranges:
+        details = []
+        if missing_reads:
+            details.append("paths " + ", ".join(missing_reads))
+        if missing_ranges:
+            details.append("ranges " + ", ".join(f"{kind}:{prefix}" for kind, prefix in missing_ranges))
+        raise SeedError("Carry has stale " + " and ".join(details) + "; re-read them (or re-run the command with seed-agent run) before proposing")
 
 
 def _content(arguments: argparse.Namespace) -> bytes:
@@ -618,19 +743,30 @@ def _run(arguments: argparse.Namespace, state: dict[str, Any], session: Session,
     if not command:
         raise SeedError("run requires a command after --")
     prefix = _scope_prefix(arguments.prefix)
+    depends = _validate_depends(arguments.depends, prefix)
+    dependency_mode = "declared-dependencies" if depends else "declared-scope"
     manifest = workspace_manifest(state_file.path)
     requested_root = str(Path(arguments.workspace).expanduser().absolute())
     if manifest is None:
-        workspace = materialize_workspace(session, requested_root, prefix=prefix, state_path=state_file.path)
+        workspace = materialize_workspace(
+            session, requested_root, prefix=prefix, state_path=state_file.path,
+            record_scope=not depends, depends=depends if depends else None,
+        )
     else:
-        if manifest["root"] != requested_root or manifest["prefix"] != prefix or manifest["base"] != session.base:
+        if manifest["root"] != requested_root or manifest["prefix"] != prefix or manifest["base"] != session.base or manifest.get("depends", []) != depends:
             raise SeedError("Workspace does not match this task, prefix, or base revision")
         workspace = {"workspace": requested_root, "prefix": prefix, "files": len(manifest["base_files"]), "manifest": str(state_file.path.with_name(state_file.path.name + ".workspace.json"))}
+        if depends:
+            workspace["depends"] = depends
 
     # Save the workspace binding and subtree guard before launching user code.
     # If the process dies after materialization, the manifest also lets the next
     # command restore this state before it can propose or land anything.
-    session.track_scope(prefix, "subtree")
+    if depends:
+        for dependency in depends:
+            session.track_scope(dependency, "subtree")
+    else:
+        session.track_scope(prefix, "subtree")
     state["workspace"] = workspace
     _save_session(state, session)
     state_file.save(state)
@@ -732,18 +868,18 @@ def _run(arguments: argparse.Namespace, state: dict[str, Any], session: Session,
     for path, payload in collect_workspace_edits(requested_root, state_path=state_file.path).items():
         session.write(path, payload)
     _save_session(state, session)
-    _record(
-        state,
-        "run",
-        command=_safe_command(command),
-        returncode=process_result["returncode"],
-        timed_out=process_result["timed_out"],
-        elapsed_ms=round((time.monotonic() - started) * 1000),
-        base=session.base,
-        overlay=_overlay_digest(session.edits),
-        dependency_mode="declared-scope",
-    )
-    return {"workspace": workspace, "dependency_mode": "declared-scope", "capture": "not-sandboxed", "overlay": _overlay_digest(session.edits), **process_result}
+    metric = {
+        "command": _safe_command(command), "returncode": process_result["returncode"],
+        "timed_out": process_result["timed_out"], "elapsed_ms": round((time.monotonic() - started) * 1000),
+        "base": session.base, "overlay": _overlay_digest(session.edits), "dependency_mode": dependency_mode,
+    }
+    if depends:
+        metric["dependencies"] = depends
+    _record(state, "run", **metric)
+    result = {"workspace": workspace, "dependency_mode": dependency_mode, "capture": "not-sandboxed", "overlay": _overlay_digest(session.edits), **process_result}
+    if depends:
+        result["dependencies"] = depends
+    return result
 
 
 def execute(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -801,6 +937,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, Any]:
             result = {"changes": session.diff()}
         elif arguments.action == "propose":
             _assert_mutable(state)
+            _assert_carry_revalidated(state, session)
             proposal = session.propose(author=arguments.author, message=arguments.message, supersedes=state["supersedes"])
             # This is deliberately saved before any land attempt.
             state["proposal"] = proposal
@@ -845,8 +982,11 @@ def execute(arguments: argparse.Namespace) -> dict[str, Any]:
             replacement = TaskFile(new_path)
             with replacement.locked():
                 new_state = _new_state(client, arguments.url, arguments.repo, supersedes=state["proposal"])
+                carry_result = _carry_rework(client, state, session, new_state) if arguments.carry else None
                 replacement.create(new_state)
             result = {"previous_task": state["task"], "proposal": state["proposal"], "result": state["result"], "diff": session.diff(), "new_task": new_state["task"], "new_state": str(new_path), "base": new_state["base"], "supersedes": state["proposal"]}
+            if carry_result is not None:
+                result["carry"] = carry_result
         elif arguments.action == "run":
             result = _run(arguments, state, session, state_file)
             changed = True
@@ -904,9 +1044,11 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("land")
     rework = commands.add_parser("rework")
     rework.add_argument("--new-state", required=True)
+    rework.add_argument("--carry", action="store_true")
     run = commands.add_parser("run")
     run.add_argument("--workspace", required=True)
     run.add_argument("--prefix", default="")
+    run.add_argument("--depends", action="append", default=[])
     run.add_argument("--command-timeout", type=float, default=60)
     run.add_argument("command", nargs=argparse.REMAINDER)
     return root

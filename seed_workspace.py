@@ -120,7 +120,8 @@ def workspace_manifest(state_path: str | Path) -> dict[str, Any] | None:
     return result
 
 
-def materialize_workspace(session: Any, root: str | Path, *, prefix: str = "", state_path: str | Path) -> dict[str, Any]:
+def materialize_workspace(session: Any, root: str | Path, *, prefix: str = "", state_path: str | Path,
+                          record_scope: bool = True, depends: list[str] | None = None) -> dict[str, Any]:
     """Create an empty workspace from the task's base plus its current overlay.
 
     ``root`` must not exist.  Refusing an existing directory makes the action
@@ -135,13 +136,24 @@ def materialize_workspace(session: Any, root: str | Path, *, prefix: str = "", s
         # The public CLI accepts either ``src`` or ``src/`` for a scope.
         prefix = file_path(prefix.rstrip("/"))
 
-    # A command can inspect more than the names returned by a listing, so use a
-    # full subtree guard here.  ``files`` additionally records its normal
-    # membership observation.
-    # Session.files returns the view after local edits, which is exactly what
-    # is materialized.
-    base_snapshot = session.track_scope(prefix, "subtree")
-    paths = list(session.files(prefix=prefix))
+    # A command can inspect more than names returned by a listing, so the
+    # normal runner records a full subtree guard.  Declared-dependency runs
+    # obtain exactly the same pinned view without recording the broad scope.
+    if record_scope:
+        base_snapshot = session.track_scope(prefix, "subtree")
+        paths = list(session.files(prefix=prefix))
+    else:
+        base_snapshot = session.client.range_snapshot(prefix, "subtree", session.base)
+        if base_snapshot.get("revision") != session.base or not isinstance(base_snapshot.get("files"), dict):
+            raise SeedError("Range snapshot does not match the session base")
+        paths = set(base_snapshot["files"])
+        for path, payload in session.edits.items():
+            if _under_prefix(path, prefix):
+                if payload is None:
+                    paths.discard(path)
+                else:
+                    paths.add(path)
+        paths = sorted(paths)
     normalized: dict[str, str] = {}
     for path in paths:
         _validate_logical_path(path)
@@ -194,11 +206,16 @@ def materialize_workspace(session: Any, root: str | Path, *, prefix: str = "", s
         # correctly represent a user reverting an earlier local edit.
         "base_files": base_files,
     }
+    if depends is not None:
+        manifest["depends"] = list(depends)
     manifest_path = _manifest_path(Path(state_path))
     if manifest_path.exists():
         raise SeedError("Workspace manifest already exists for this task")
     _atomic_json(manifest_path, manifest)
-    return {"workspace": str(root_path), "prefix": prefix, "files": len(base_files), "manifest": str(manifest_path)}
+    result = {"workspace": str(root_path), "prefix": prefix, "files": len(base_files), "manifest": str(manifest_path)}
+    if depends is not None:
+        result["depends"] = list(depends)
+    return result
 
 
 def collect_workspace_edits(root: str | Path, *, state_path: str | Path) -> dict[str, bytes | None]:
