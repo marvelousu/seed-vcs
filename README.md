@@ -2,397 +2,326 @@
 
 [![Tests](https://github.com/marvelousu/seed-vcs/actions/workflows/test.yml/badge.svg)](https://github.com/marvelousu/seed-vcs/actions/workflows/test.yml)
 
-Seed is a version-control service for concurrent agents. It applies **immutable,
-conditional change proposals** to a shared file state, with a Python client,
-an authenticated HTTP API, PostgreSQL metadata and content-addressed file objects.
-The original SQLite CLI remains available using only Python's standard library.
+Seed is a version-control service for many coding agents that edit the same set
+of files at the same time. An agent submits a **proposal**: *if the files I read
+and the files I am replacing still have the contents I started with, apply these
+replacements together.* The server either lands the whole proposal or refuses it
+and names the paths that changed.
 
-A proposal says: *if these files still contain the contents I started with,
-apply these replacements together.* Unrelated changes can land in the meantime
-without invalidating it. Changes to its write targets or declared dependencies
-cause the whole proposal to be rejected.
+With Git, an agent that falls behind has to rebase or merge before it can
+publish, even when nobody touched its files. In Seed, a proposal lands as it is
+when unrelated changes went in first, and it is refused before publication when
+something it read has changed.
 
-Agent sessions pin a revision and automatically capture files read through the
-client API. Independent changes can land without rebuilding their proposals.
-Multiple service workers share PostgreSQL and the object volume.
+[Is Seed for you?](#is-seed-for-you) · [Install](#requirements-and-install) ·
+[Try it](#try-it-in-one-minute) · [Use it from an agent](#use-it-from-an-agent) ·
+[What lands](#what-lands-and-what-is-refused) ·
+[After a refusal](#when-a-proposal-is-refused) · [Limits](#limits) ·
+[Documentation](#documentation)
 
-[Quick start](#quick-start) · [Usage](#usage) · [How it works](#how-it-works) ·
-[Storage and behavior](#storage-and-behavior) · [Contributing](#contributing)
+## Is Seed for you?
 
-## Features
+Seed fits when:
 
-- **Conditional writes.** Each edited path carries an expected content hash.
-- **Captured read dependencies.** Agent sessions record reads at their pinned
-  revision, including missing files. Low-level APIs also accept explicit reads.
-- **Working sessions.** Reads, listings and literal text searches include
-  pending edits. Listings guard membership; searches guard the scoped subtree.
-- **Restartable agent tasks.** A JSON CLI saves task state, proposals and
-  outcomes, and supports explicitly scoped command workspaces.
-- **Revision-bound validation.** Keep integrated, verified and deployable
-  revisions separate; optionally validate a combined candidate before landing.
-- **Git bridge and recovery.** Import a regular-file Git snapshot, export
-  revisions to a dedicated Git branch, and verify logical repository backups.
-- **Atomic landing.** File updates, history, and the head revision are published
-  in one transaction, or rolled back together.
-- **Idempotent retries.** Landing an accepted proposal again returns its original
-  revision without adding another history entry.
-- **Historical reads.** Retrieve previous file contents, including empty files
-  and files that have since been deleted.
-- **Concurrent service workers.** PostgreSQL coordinates publishers across
-  processes; each repository has its own head lock and metadata schema.
-- **Batch landing.** Accept multiple proposals in one transaction while keeping
-  a separate result and revision for each successful proposal.
-- **Repository-scoped credentials.** Restrict a bearer credential to named
-  repositories and read, write, create, validate or promote permissions.
-- **Bounded queries.** File and revision listings use cursor-based pages.
+- Several agents or scripts change one shared tree concurrently, mostly in
+  different files, and rebuilding every change on the newest head costs you time.
+- A change built on an outdated file should be stopped before it is published,
+  not discovered after a merge.
+- You still deliver through Git. The [Git bridge](docs/git-bridge.md) imports a
+  snapshot and exports landed revisions to a dedicated branch.
 
-## Quick start
+Seed is the wrong tool when:
 
-Requires **Python 3.12 or later**. Clone the repository and run the demonstration:
+| You need | Use instead |
+| --- | --- |
+| Branches, pull requests and human review | Git with a forge. Seed has one head per repository and no review interface. |
+| The server to merge concurrent edits to one file | Seed refuses the later proposal. `seed-agent rework --carry` merges in the client and submits a new proposal; see [After a refusal](#when-a-proposal-is-refused). |
+| File modes, symlinks or submodules | Git. Seed stores regular file contents under logical paths. |
+| Proof that the combined program works | Your tests. Landing checks file conditions only; [validation targets](docs/validation.md) record which revisions passed your checks. |
+| A packaged, stable release | Seed is version 0.4, before 1.0, and is installed from a clone. It is not on PyPI. |
+
+## Requirements and install
+
+Python 3.12 or later. On systems that expose Python as `python3`, use that name.
 
 ```sh
 git clone https://github.com/marvelousu/seed-vcs.git
 cd seed-vcs
+```
+
+| To | Install |
+| --- | --- |
+| Run the demo, the local SQLite CLI, or `Store` | Nothing. They use the standard library only. |
+| Use `seed-agent` or the Python client against a service | `python -m pip install --no-deps -e .` (standard library only) |
+| Run the service | `python -m pip install -r requirements-server.txt`, then the line above |
+| Run several service workers | PostgreSQL and an object volume shared by all workers; see [Running the service](docs/service.md) |
+
+## Try it in one minute
+
+```sh
 python demo.py
 ```
 
-On systems where Python is exposed as `python3`, use that command instead.
-There is no package installation or build step.
+The demo uses a temporary database and removes it afterwards.
 
-The demo creates an isolated temporary database and exercises independent
-changes, conflicting writes, declared read dependencies, and retries. It also
-shows an accepted change that breaks a program because a dependency was not
-declared. Successful landing checks file conditions; it does not establish
-program correctness.
+```text
+1. Two independent proposals from the same base:
+   A: landed
+   B, after HEAD advanced: landed
+2. A stale edit of the same file:
+   refused: a.py
+   extra.py was not partially published
+3. Different write path, but a declared read dependency changed:
+   refused: api.py
+4. The same dependency, left undeclared:
+   proposal: landed
+   actual program: NameError (semantic correctness still needs tests)
+5. Retry an already landed proposal:
+   A: already-landed
+   no additional revision; all demo assertions passed
+```
 
-## Run the service
+Step 4 is deliberate. Seed only knows about a dependency that was read through
+it or declared. Agent sessions record their reads automatically, which is why
+the next section uses them.
 
-Install the service and create a credential for a repository:
+## Use it from an agent
+
+Steps 1 to 3 and [After a refusal](#when-a-proposal-is-refused) were run in this
+order against a fresh service, and the output shown is what they printed.
+Revision and proposal IDs are shortened to eight characters, and yours will
+differ.
+
+### 1. Start a service and create a repository
 
 ```sh
 python -m pip install -r requirements-server.txt
 python -m pip install --no-deps -e .
 seed-server token --repo demo
+```
+
+`token` prints a bearer credential on one line, once. Only its SHA-256 digest is
+stored, in `.seed/credentials.json`. Put the credential in the `SEED_TOKEN`
+environment variable of the terminal your agents run in:
+
+```bash
+export SEED_TOKEN='<token>'
+```
+
+```powershell
+$env:SEED_TOKEN = '<token>'
+```
+
+Start the service in a second terminal, from the same directory. It listens on
+`127.0.0.1:7331` and keeps repositories in SQLite files under `.seed/repos`.
+
+```sh
 seed-server serve
 ```
 
-The `token` command prints the bearer credential once and adds its SHA-256
-digest to `.seed/credentials.json`. Keep the credential in your secret manager;
-the service reads only the digest file. Restart workers after updating grants.
-The default listener is `127.0.0.1:7331`. Without `SEED_DATABASE_URL`, repositories
-use SQLite files under `.seed/repos`.
-
-For PostgreSQL, supply `SEED_DATABASE_URL` through your secret manager or process
-configuration, then start multiple workers:
+Create the repository. This call is idempotent.
 
 ```sh
-seed-server serve --workers 4
+python -c "import os; from seed_client import Client; print(Client('http://127.0.0.1:7331', 'demo', os.environ['SEED_TOKEN']).create())"
 ```
 
-The PostgreSQL account must be able to create schemas in the selected database.
-Workers use PostgreSQL for metadata and `.seed/objects` for file bytes. All
-workers and hosts serving the same repositories must share that object volume.
-Serve remote connections through an HTTPS reverse proxy; remote HTTP is rejected
-by the client unless explicitly enabled.
-
-| Configuration | Default | Purpose |
-| --- | --- | --- |
-| `SEED_DATA` | `.seed` | Object directory and local SQLite repositories. |
-| `SEED_AUTH_FILE` | `$SEED_DATA/credentials.json` | Repository grants and credential digests. |
-| `SEED_DATABASE_URL` | unset | PostgreSQL connection string; unset selects SQLite. |
-| `SEED_POOL_SIZE` | `16` | Maximum PostgreSQL connections per worker. |
-
-Requests are limited to 8 MiB, proposals to 1,000 write paths and 1,000 read
-paths, landing batches to 256 proposals, and listing pages to 1,000 items.
-The server also limits concurrent connections and queued database acquisitions.
-
-### Agent client
-
-The client uses Python's standard library. Pass your credential from the
-environment populated by your secret manager:
-
-```python
-import os
-from seed_client import Client
-
-client = Client("http://127.0.0.1:7331", "demo", os.environ["SEED_TOKEN"])
-client.create()  # Idempotent repository creation; requires create permission.
-
-task = client.begin()
-previous = task.read("greeting.txt")  # Read condition is captured automatically.
-task.write("greeting.txt", b"Hello from an agent!\n")
-proposal = task.propose(author="agent-1", message="Update greeting")
-print(client.land(proposal))
+```text
+{'revision': '4fc7b637…'}
 ```
 
-In version 0.3, `task.read()` reads the pinned base **plus pending edits**.
-Use `task.read_base()` to read the original pinned version explicitly. An absent
-file is captured as an absence condition. `task.write(path, None)` proposes
-deletion. `task.files("src/")` records directory membership, while
-`task.search("TODO", "src/")` guards all paths and contents in that subtree,
-including files which did not match. Scopes are bounded to 10,000 files and
-proposals to 64 range conditions; oversized scopes fail rather than truncate
-their dependency conditions. Search output is bounded separately.
+### 2. Run one task from start to finish
 
-The [agent workflow guide](docs/agent-workflow.md) covers the persistent
-`seed-agent` CLI, command workspaces, safe rework and the version 0.3 upgrade.
-
-Version 0.4 adds [validation and deployment targets](docs/validation.md),
-the [one-way Git bridge](docs/git-bridge.md), and [backup/restore](docs/backup.md).
-The [agent comparison guide](docs/agent-comparison.md) explains how captured
-coding traces are replayed against Seed and automated Git workflows.
-The [wide-directory publication experiment](docs/wide-tree-benchmark.md) tests
-local integration cost against a batched bare-Git importer, with small and
-sharded controls.
-
-`Client.land_many(ids)` returns one result per proposal. Conflicts and namespace
-errors do not undo other successful proposals; a database failure rolls back
-the whole batch. HTTP 409 reports changed conditions. Temporary connection
-errors and HTTP 429/503 are retried up to three times. Replaying a successful
-landing returns `already-landed` and the original revision.
-
-### Containers
-
-The included Compose configuration starts PostgreSQL and four service workers.
-Create `.seed/credentials.json` with the token command first, supply
-`POSTGRES_PASSWORD` through your secret manager, and run:
+Each task keeps its state in a JSON file, so an agent can stop and continue
+later. `begin` pins the current revision.
 
 ```sh
-docker compose up --build -d
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-init.json begin
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-init.json write config.txt --content greeting=Hello
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-init.json write notes.md --content "# Notes"
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-init.json propose --author you --message "Initial files"
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-init.json land
 ```
 
-The port binds to loopback. Metadata and objects use persistent volumes. The
-application runs as a non-root user. `/healthz` checks the process and `/readyz`
-checks database availability. Back up PostgreSQL and its referenced objects
-together. Uploaded objects are retained; the service does not delete them.
+Every command prints one JSON object. The last two print:
 
-## Usage
-
-Run commands from the repository directory. `--db` selects the SQLite database
-and must appear before the subcommand; it defaults to `seed.db`.
-
-### CLI
-
-This example creates a database, submits a file, and reads it back. Use an unused
-database path: `init` refuses to overwrite an existing file.
-
-**Bash**
-
-```bash
-python seed.py --db example.db init
-python -c "from pathlib import Path; Path('payload.txt').write_bytes(b'Hello, Seed!\n')"
-base=$(python seed.py --db example.db head)
-proposal=$(python seed.py --db example.db propose --base "$base" --set hello.txt=payload.txt --author alice --message "Add a greeting")
-python seed.py --db example.db show "$proposal"
-python seed.py --db example.db land "$proposal"
-python seed.py --db example.db cat hello.txt
+```json
+{"base":"4fc7b637…","proposal":"b7c83a4c…","status":"pending"}
+{"revision":"0e98dc31…","status":"landed"}
 ```
 
-**PowerShell**
+`write` also accepts `--file PATH` and `--stdin`. `diff` shows the pending
+edits, `status` shows the proposal's outcome, and `list` and `search` read the
+tree. See the [agent workflow guide](docs/agent-workflow.md) for every command.
 
-```powershell
-python seed.py --db example.db init
-python -c "from pathlib import Path; Path('payload.txt').write_bytes(b'Hello, Seed!\n')"
-$base = python seed.py --db example.db head
-$proposal = python seed.py --db example.db propose --base $base --set hello.txt=payload.txt --author alice --message "Add a greeting"
-python seed.py --db example.db show $proposal
-python seed.py --db example.db land $proposal
-python seed.py --db example.db cat hello.txt
+### 3. Let two agents work at once
+
+Agent A reads `config.txt` and prepares a new file. Before A publishes, agent B
+lands a change to a file A did not touch.
+
+```sh
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-a.json begin
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-a.json read config.txt
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-a.json write banner.txt --content "Hello, world"
+
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-b.json begin
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-b.json write notes.md --content "# Notes for agents"
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-b.json propose --author agent-b --message "Retitle notes"
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-b.json land
+
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-a.json propose --author agent-a --message "Add banner"
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-a.json land
 ```
 
-The final command prints `Hello, Seed!`. Creating a proposal does not update the
-current file state; `land` does.
+A's proposal still names the old base, and it lands without being rebuilt:
 
-`--set REPO_PATH=LOCAL_FILE` reads bytes from a local file and stores them under a
-logical repository path. Repeat `--set` to submit several files together. Use
-`--delete REPO_PATH` for deletions and `--read REPO_PATH` for additional read
-conditions. A rename is a deletion and an addition in the same proposal.
+```json
+{"base":"0e98dc31…","proposal":"69e8c9fb…","status":"pending"}
+{"revision":"0aa0da47…","status":"landed"}
+```
 
-Read conditions are captured from `--base`. Read dependencies from that revision
-when preparing a change; listing a path with `--read` does not automatically
-observe files read by an editor or another process.
+### 4. Run a command against the task's files
 
-### Command reference
+`run` writes the task's view of the repository into a directory, runs a command
+there, and records what the command depended on. This example assumes a
+repository with `src/` and `tests/`:
 
-| Command | Purpose |
+```sh
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-t.json run --workspace work --depends src --depends tests -- python -B -m unittest discover -s tests
+```
+
+The result contains the command's `returncode`, `stdout` and `stderr`, and
+`"dependency_mode":"declared-dependencies"` with `"dependencies":["src","tests"]`.
+
+- Without `--depends`, the whole materialized tree becomes a dependency, and a
+  later change to any file in it refuses the proposal.
+- With `--depends`, only the named subtrees and the files you edit are
+  conditions. A command that reads other repository files needs them declared
+  too.
+- The command is an ordinary process (`"capture":"not-sandboxed"`). Seed records
+  what you declare, not what the process opened.
+
+## What lands and what is refused
+
+| Since your task began | Result |
 | --- | --- |
-| `init` | Create an empty database and its initial revision. |
-| `head` | Print the current revision ID. |
-| `propose --base REV --set PATH=FILE` | Store a proposal; print its ID. |
-| `show PROPOSAL` | Print a proposal's conditions, writes, and metadata as JSON. |
-| `land PROPOSAL` | Apply the proposal or report a conflict. |
-| `ls [--rev REV]` | Print a JSON map of paths to content IDs. |
-| `cat PATH [--rev REV]` | Write the file's raw bytes to standard output. |
-| `log` | Print accepted revisions in chronological order as JSON. |
+| Other files changed, none that you read or wrote | Lands, without rebuilding the proposal |
+| A file you are replacing or deleting changed | Refused |
+| A file you read changed, was created, or was deleted | Refused |
+| A file was added to or removed from a directory you listed | Refused |
+| Anything changed under a subtree you searched or ran a command against | Refused; narrow command dependencies with `run --depends` |
+| A file changed and changed back to the same contents | Lands; conditions compare contents |
+| One condition of a multi-file proposal fails | Refused as a whole; nothing is published |
+| You land the same proposal again | Returns the original revision; history does not grow |
+| A file your change depends on, but never read through Seed, changed | Lands. Seed cannot see that dependency, so test the combined result |
 
-`land` reports `landed` or `already-landed` with the resulting revision ID.
-Conditions that no longer match are reported as JSON on standard error, with
-the expected and actual content IDs for each conflicting path.
+## When a proposal is refused
 
-| Exit code | Meaning |
-| --- | --- |
-| `0` | The command succeeded. |
-| `1` | A storage, input, or namespace error occurred. |
-| `2` | Proposal conditions conflicted, or command-line parsing failed. |
+Agent C reads `config.txt` and writes `banner.txt`. Agent D then lands a change
+to `config.txt`. C's `land` exits with code 0 and reports the conflict in JSON:
 
-### Python API
-
-The same operations are available through `Store` in [seed.py](seed.py):
-
-```python
-from seed import Store
-
-store = Store.create("api-example.db")
-base = store.head()
-
-first = store.propose(base, {"a.txt": b"A\n"}, author="agent-a")
-second = store.propose(base, {"b.txt": b"B\n"}, author="agent-b")
-
-store.land(first)
-store.land(second)  # Still valid: b.txt has not changed since base.
-
-assert store.read("a.txt") == b"A\n"
-assert store.read("b.txt") == b"B\n"
-assert store.read("a.txt", base) is None
+```json
+{"head":"f4fabf33…","paths":{"config.txt":{"actual":"ae314970…","expected":"db95be2c…","kind":"content"}},"status":"conflict"}
 ```
 
-Use `Store("existing.db")` to open a database. `propose` accepts a mapping of
-paths to `bytes` or `None`, with `None` representing deletion. Its `reads`
-argument declares additional dependency paths. `land` raises `Conflict` when
-conditions differ; `Conflict.differences` contains the conflicting paths.
+Start a new task on the current head and carry the old edits over:
 
-## How it works
+```sh
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-c.json rework --new-state task-c2.json --carry
+```
 
-Seed combines content-addressed objects with optimistic concurrency control.
-Its model has three parts:
+The `carry` part of the result says what happened to each path:
 
-| Object | Contents |
+```json
+{"already_applied":[],"carried":["banner.txt"],"conflicts":[],"kept_ranges":[],"kept_reads":[],"merged":[],"stale_ranges":[],"stale_reads":["config.txt"]}
+```
+
+| Field | Meaning |
 | --- | --- |
-| Blob | Immutable file bytes, identified by a type-prefixed SHA-256 hash. |
-| Proposal | A base revision, expected file hashes, desired replacements, and author/message metadata, encoded as canonical JSON. |
-| Revision | The previous head and the accepted proposal ID. |
+| `carried` | Your edit was reapplied; nobody else changed the file. |
+| `merged` | Someone else changed the same file. Both sets of changes were combined line by line. |
+| `conflicts` | The changes could not be combined. The reason is `overlapping-changes` (the changed regions touch or overlap), `add-add`, `delete-modify` or `binary`. Nothing was written for this path; redo the edit by hand. |
+| `already_applied` | The head already contains your edit. |
+| `kept_reads`, `kept_ranges` | Files and scopes you read that did not change. They stay conditions of the new task. |
+| `stale_reads`, `stale_ranges` | Files and scopes you read that did change. Read them again before proposing. |
 
-Write conditions are inferred from the proposal's base revision. Declared read
-conditions are added to the same set. `null` means the file is absent, which is
-different from the hash of an empty file.
+Seed does not let the new task claim a read it has not repeated:
 
-Landing takes a SQLite write transaction, checks for a previous acceptance,
-compares all conditions against the current file state, and applies all writes.
-It validates the resulting file namespace, records the revision and per-path
-history, then advances the head. Any failure rolls back the transaction.
+```sh
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-c2.json propose --author agent-c --message "Greet everyone"
+```
 
-The proposal remains unchanged when the head advances. The new revision's
-parent is the actual head at landing time, rather than the proposal's original
-base. Two independent proposals can produce the same final file state in either
-order, while producing different revision IDs and history.
+```json
+{"message":"Carry has stale paths config.txt; re-read them (or re-run the command with seed-agent run) before proposing","status":"error"}
+```
 
-The database maintains a current path table and per-path version records,
-including deletion records. Landing records only the edited paths rather than
-copying a full repository snapshot. Historical reads use those version records
-to reconstruct file state at a revision.
+Read the changed file, adjust the edit if the new contents call for it, and
+publish:
 
-## Storage and behavior
+```sh
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-c2.json read config.txt
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-c2.json write banner.txt --content "Hi, everyone"
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-c2.json propose --author agent-c --message "Greet everyone"
+seed-agent --url http://127.0.0.1:7331 --repo demo --state task-c2.json land
+```
 
-Both storage backends use the same proposal and revision identities and landing
-rules. SQLite stores file bytes in its database. PostgreSQL stores blob IDs and
-sizes while the object volume holds the immutable bytes; reads verify their
-content hashes. Proposal creation and uploads do not take the repository head
-lock. Landing locks that repository's head, checks conditions and publishes the
-revision. Batch landing amortizes lock acquisition and durable commit overhead.
+```json
+{"revision":"74cd5fb9…","status":"landed"}
+```
 
-[Architecture](docs/architecture.md) describes the protocol and transaction
-boundaries. The local task adapter materializes scoped regular-file workspaces;
-the core service publishes file states. The Git bridge handles explicit one-way
-snapshot import and revision export. Line-based merging and simultaneous
-two-way synchronization remain separate design work.
+A merged file has not been tested in its merged form. Run your tests again with
+`seed-agent run` before proposing.
 
-The following details matter when evaluating it:
+## Limits
 
-- **Dependencies follow the operations used.** Session reads capture file
-  content and absence; `files` captures scoped membership; `search` captures a
-  conservative subtree condition. Arbitrary shell and external inputs need
-  explicit handling. Test and review the combined program separately.
-- **Conflicts are conservative.** Different edits to the same file conflict,
-  including edits to unrelated lines. Conditions compare current contents; a
-  file that changed from A to B and back to A matches an A condition.
-- **No-op writes are omitted.** Their implicit conditions are omitted too. Use
-  `reads` to retain a condition on such a path. Proposals with no effective
-  writes are rejected.
-- **Paths are logical names.** Paths are case-sensitive, relative POSIX paths.
-  A file named `pkg` cannot coexist with `pkg/config`. File modes, symlinks,
-  submodules, and filesystem-specific export rules are not represented.
-- **Publishers have a single ordered head per repository.** PostgreSQL readers
-  use repeatable snapshots; publishers serialize on that head. Separate
-  repositories proceed independently. SQLite allows one writer per database.
-  Use SQLite's backup API to obtain a consistent live backup;
-  copying only the database file can miss pending WAL contents.
+- **Sizes.** A request is at most 8 MiB. A proposal has at most 1,000 write
+  paths, 1,000 read paths and 64 range conditions. A listed or searched scope
+  holds at most 10,000 files; a larger scope fails instead of being truncated.
+  A landing batch holds at most 256 proposals, and a listing page 1,000 items.
+- **Conflicts are per file on the server.** Two edits to different lines of one
+  file conflict at landing. Merging happens only in `rework --carry`.
+- **Paths are logical names.** They are case-sensitive, relative POSIX paths. A
+  file named `pkg` cannot coexist with `pkg/config`.
+- **One ordered head per repository.** Publishers to the same repository are
+  serialized. SQLite allows one writer per database; use PostgreSQL for several
+  workers.
+- **Author names are self-reported.** A content hash identifies bytes. It does
+  not authenticate a contributor or stand for a review.
+- **`seed-agent` exit codes.** `0` means the command ran, including a `land`
+  that reports `"status":"conflict"`, so check the JSON. `1` means the command
+  given to `run` failed or timed out. `2` means an error, reported as
+  `{"status":"error","message":…}`.
+- **Remote access needs HTTPS.** The client rejects remote HTTP unless you pass
+  `--allow-http`. Put the service behind an HTTPS reverse proxy.
 
-Author metadata is self-reported. Content hashes identify bytes; they do not
-authenticate a contributor or represent a review approval.
+## Documentation
+
+| Page | Read it when you want to |
+| --- | --- |
+| [Agent tasks and dependency conditions](docs/agent-workflow.md) | Use every `seed-agent` command, command workspaces, and rework |
+| [Running the service](docs/service.md) | Configure the service, PostgreSQL, containers, and the Python client |
+| [Local SQLite CLI and `Store`](docs/local-cli.md) | Use Seed in one process without a service |
+| [Data model and landing rules](docs/model.md) | Understand blobs, proposals, revisions, and what landing checks |
+| [Service architecture](docs/architecture.md) | See the protocol and transaction boundaries |
+| [Validation and deployment targets](docs/validation.md) | Track which revisions passed your checks and which are deployable |
+| [Git bridge](docs/git-bridge.md) | Import a Git snapshot or export revisions to a Git branch |
+| [Backup and restore](docs/backup.md) | Back up a repository and verify the copy |
+| [Development, tests and measurements](docs/development.md) | Run the tests, the load measurement, and the Git comparisons |
+
+Recorded measurements: [HTTP load run](docs/benchmark.md),
+[wide-directory publication](docs/wide-tree-benchmark.md),
+[replayed agent traces](docs/agent-comparison.md), and the
+[live coding study](docs/live-agent-study.md).
 
 ## Development
 
-Run the behavioral suite and demo from the repository directory:
-
 ```sh
-python -m unittest -v test_seed.py test_predicates.py test_backup.BackupTests test_git.py test_comparison.py test_workflow_environment.py
+python -m unittest -v test_seed.py test_predicates.py test_backup.BackupTests test_git.py test_comparison.py test_workflow_environment.py test_merge.py
 python demo.py
 ```
 
-Install service test dependencies and run the HTTP contracts:
-
-```sh
-python -m pip install httpx==0.28.1
-python -m unittest -v test_service.ServiceTests test_session.py test_agent.py test_validation.ValidationTests
-```
-
-Set `SEED_TEST_DATABASE_URL` to a **dedicated test database** and run
-`python -m unittest -v test_service.PostgresServiceTests test_validation.PostgresValidationTests test_backup.PostgresBackupTests`
-to exercise the HTTP, validation and restore contracts on PostgreSQL. Tests
-create and remove their own random schemas.
-CI runs SQLite/core and service tests on Windows and Linux, PostgreSQL contracts
-on Linux, and builds the container image.
-
-### Load measurement
-
-Use an empty repository with an authorized credential to measure the real HTTP
-service. Load an initial repository, submit independent changes from concurrent
-clients, then verify all file paths and revision sequence numbers:
-
-```sh
-seed-benchmark --repo bench --files 100000 --proposals 1000 --clients 64 --batch 8 --output result.json
-```
-
-The command reads `SEED_TOKEN`. Results include completed proposals, throughput,
-batch latency percentiles, failures and the client environment. It measures
-proposal creation and landing over HTTP, including blob uploads. Initial
-repository loading and final verification are timed separately from submissions.
-
-A [recorded run](docs/benchmark.md) used 100,000 initial paths, four HTTP workers
-and 64 concurrent clients: 1,000 proposals landed in 18.41 seconds with no errors.
-The report includes the payload sizes, initial load time and latency percentiles.
-
-The suite covers independent proposals, rejected writes with no partial
-publication, declared read conditions, idempotent retries, historical reads,
-namespace collisions, storage-failure rollback, and multiple writer processes.
-It also covers scoped dependency conditions, work-view semantics, persistent
-task recovery and command workspace safety. Legacy low-level calls still
-demonstrate what happens when a dependency is not declared.
-
-For a deterministic comparison with automated Git and Git with equivalent
-dependency checks, run `python workflow_benchmark.py --output artifacts/workflow-replay.json`.
-See the [workflow guide](docs/agent-workflow.md#measure-before-extending-the-architecture)
-for what this replay measures and how it differs from live coding runs.
-
-The opt-in [live coding study](docs/live-agent-study.md) runs fresh Claude Code
-sessions on a small asset-review CLI using Seed, automated Git integration, and
-Git with an equivalent application-scope condition. Its protocol, correctness
-checks, repair limits, timing categories, and individual results are recorded
-separately from deterministic replay benchmarks. Live model calls never run in CI.
-
-[GitHub Actions](https://github.com/marvelousu/seed-vcs/actions/workflows/test.yml)
-runs the suite and demo on Ubuntu and Windows with Python 3.12. Tests and the
-demo use temporary databases under `artifacts/tmp` and clean them up on exit.
+The service tests, the PostgreSQL contracts and the measurements are described
+in [Development, tests and measurements](docs/development.md). CI runs the suite
+on Ubuntu and Windows with Python 3.12.
 
 ## Contributing
 

@@ -26,6 +26,7 @@ class FakeClient:
     proposal = "proposal-1"
     status_value = {"proposal": proposal, "status": "pending", "revision": None, "head": head_value}
     land_mode = "normal"
+    revision_files = {}
 
     def __init__(self, url, repository, token, **kwargs):
         self.url, self.repository, self.token = url, repository, token
@@ -34,20 +35,23 @@ class FakeClient:
         return type(self).head_value
 
     def read(self, path, revision=None):
-        return type(self).files.get(path)
+        return type(self).revision_files.get(revision, type(self).files).get(path)
 
     def range_snapshot(self, prefix="", kind="membership", revision=None):
+        files = type(self).revision_files.get(revision, type(self).files)
         scoped = {
             path: object_id("blob", payload)
-            for path, payload in type(self).files.items()
+            for path, payload in files.items()
             if path.startswith(prefix)
         }
-        return {"revision": revision or type(self).head_value, "prefix": prefix, "kind": kind, "paths": sorted(scoped), "files": scoped, "fingerprint": "fixed"}
+        return {"revision": revision or type(self).head_value, "prefix": prefix, "kind": kind, "paths": sorted(scoped), "files": scoped, "fingerprint": object_id("range", repr(sorted(scoped.items())).encode())}
 
     def read_blob(self, identifier):
-        for payload in type(self).files.values():
-            if object_id("blob", payload) == identifier:
-                return payload
+        versions = [type(self).files, *type(self).revision_files.values()]
+        for files in versions:
+            for payload in files.values():
+                if object_id("blob", payload) == identifier:
+                    return payload
         raise SeedError("unknown fake blob")
 
     def propose(self, base, edits, **kwargs):
@@ -77,6 +81,7 @@ class AgentTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.state = self.root / "task.json"
         FakeClient.files = {"src/a.txt": b"old\n", "src/b.txt": b"remove\n", "price.txt": b"700\n"}
+        FakeClient.revision_files = {}
         FakeClient.head_value = "head-1"
         FakeClient.status_value = {"proposal": "proposal-1", "status": "pending", "revision": None, "head": "head-1"}
         FakeClient.land_mode = "normal"
@@ -146,6 +151,106 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(rework["supersedes"], "proposal-1")
         self.assertEqual(rework["reads"], [])
         self.assertEqual(rework["edits"], {})
+
+    def test_rework_carry_reports_carried_merged_conflicted_and_already_applied(self):
+        FakeClient.files = {
+            "carried.txt": b"base\n", "merged.txt": b"top\nbase\nbottom\n",
+            "conflict.txt": b"base\n", "delete.txt": b"base\n", "applied.txt": b"base\n",
+        }
+        FakeClient.revision_files = {"head-1": dict(FakeClient.files)}
+        self.assertEqual(self.invoke("begin")[0], 0)
+        for path, content in (("carried.txt", "edit\n"), ("merged.txt", "top\nbase\nEDIT\n"),
+                              ("conflict.txt", "edit\n"), ("applied.txt", "edit\n")):
+            self.assertEqual(self.invoke("write", path, "--content", content)[0], 0)
+        self.assertEqual(self.invoke("delete", "delete.txt")[0], 0)
+        self.assertEqual(self.invoke("propose")[0], 0)
+        FakeClient.head_value = "head-2"
+        FakeClient.revision_files["head-2"] = {
+            "carried.txt": b"base\n", "merged.txt": b"TOP\nbase\nbottom\n",
+            "conflict.txt": b"head\n", "delete.txt": b"head\n", "applied.txt": b"edit\n",
+        }
+        new_state = self.root / "carry.json"
+        code, result = self.invoke("rework", "--new-state", str(new_state), "--carry")
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["carry"]["carried"], ["carried.txt"])
+        self.assertEqual(result["carry"]["merged"], ["merged.txt"])
+        self.assertEqual(result["carry"]["already_applied"], ["applied.txt"])
+        self.assertEqual(result["carry"]["conflicts"], [{"path": "conflict.txt", "reason": "overlapping-changes"}, {"path": "delete.txt", "reason": "delete-modify"}])
+        carried = json.loads(new_state.read_text(encoding="utf-8"))
+        self.assertNotIn("conflict.txt", carried["edits"])
+        self.assertNotIn("delete.txt", carried["edits"])
+        self.assertEqual(base64.b64decode(carried["edits"]["merged.txt"]), b"TOP\nbase\nEDIT\n")
+        seed_agent._validate_state(carried)
+
+    def test_carry_stale_read_blocks_then_re_read_allows_proposal(self):
+        FakeClient.revision_files = {"head-1": dict(FakeClient.files)}
+        self.assertEqual(self.invoke("begin")[0], 0)
+        self.assertEqual(self.invoke("read", "src/a.txt")[0], 0)
+        self.assertEqual(self.invoke("write", "price.txt", "--content", "800\n")[0], 0)
+        self.assertEqual(self.invoke("propose")[0], 0)
+        FakeClient.head_value = "head-2"
+        FakeClient.revision_files["head-2"] = {**FakeClient.revision_files["head-1"], "src/a.txt": b"changed\n"}
+        new_state = self.root / "stale.json"
+        self.assertEqual(self.invoke("rework", "--new-state", str(new_state), "--carry")[0], 0)
+        self.state = new_state
+        self.assertNotIn("src/a.txt", self.state_data()["reads"])
+        code, failure = self.invoke("propose")
+        self.assertEqual(code, 2)
+        self.assertIn("re-read", failure["message"])
+        self.assertEqual(self.invoke("read", "src/a.txt")[0], 0)
+        self.assertEqual(self.invoke("propose")[0], 0)
+
+    def test_carry_keeps_unchanged_read_and_allows_later_edit_removal(self):
+        FakeClient.revision_files = {"head-1": dict(FakeClient.files)}
+        self.assertEqual(self.invoke("begin")[0], 0)
+        self.assertEqual(self.invoke("read", "src/a.txt")[0], 0)
+        self.assertEqual(self.invoke("write", "price.txt", "--content", "800\n")[0], 0)
+        self.assertEqual(self.invoke("propose")[0], 0)
+        FakeClient.head_value = "head-2"
+        FakeClient.revision_files["head-2"] = dict(FakeClient.files)
+        carried = self.root / "kept.json"
+        code, result = self.invoke("rework", "--new-state", str(carried), "--carry")
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["carry"]["kept_reads"], ["src/a.txt"])
+        self.assertEqual(result["carry"]["kept_ranges"], [])
+        carried_state = json.loads(carried.read_text(encoding="utf-8"))
+        self.assertIn("src/a.txt", carried_state["reads"])
+        carried_state["edits"].pop("price.txt")
+        carried.write_text(json.dumps(carried_state), encoding="utf-8")
+        self.state = carried
+        self.assertEqual(self.invoke("status")[0], 0)
+
+    def test_run_depends_narrows_ranges_and_is_stable(self):
+        self.assertEqual(self.invoke("begin")[0], 0)
+        workspace = self.root / "depends"
+        code, result = self.invoke("run", "--workspace", str(workspace), "--prefix", "", "--depends", "src", "--", sys.executable, "-c", "pass")
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["dependency_mode"], "declared-dependencies")
+        self.assertEqual(result["dependencies"], ["src"])
+        self.assertEqual(self.state_data()["ranges"], [{"kind": "subtree", "prefix": "src/"}])
+        code, failure = self.invoke("run", "--workspace", str(workspace), "--prefix", "", "--depends", "price.txt", "--", sys.executable, "-c", "pass")
+        self.assertEqual(code, 2)
+        self.assertIn("Workspace does not match", failure["message"])
+        self.state = self.root / "outside.json"
+        self.assertEqual(self.invoke("begin")[0], 0)
+        code, failure = self.invoke("run", "--workspace", str(self.root / "outside"), "--prefix", "src", "--depends", "price.txt", "--", sys.executable, "-c", "pass")
+        self.assertEqual(code, 2)
+        self.assertIn("beneath", failure["message"])
+
+    def test_run_on_carried_task_keeps_edits_outside_workspace_scope(self):
+        FakeClient.revision_files = {"head-1": dict(FakeClient.files)}
+        self.assertEqual(self.invoke("begin")[0], 0)
+        self.assertEqual(self.invoke("write", "price.txt", "--content", "800\n")[0], 0)
+        self.assertEqual(self.invoke("propose")[0], 0)
+        FakeClient.head_value = "head-2"
+        FakeClient.revision_files["head-2"] = dict(FakeClient.files)
+        carried = self.root / "carried-run.json"
+        self.assertEqual(self.invoke("rework", "--new-state", str(carried), "--carry")[0], 0)
+        self.state = carried
+        workspace = self.root / "carried-run-workspace"
+        code, result = self.invoke("run", "--workspace", str(workspace), "--prefix", "src", "--", sys.executable, "-c", "pass")
+        self.assertEqual(code, 0, result)
+        self.assertEqual(base64.b64decode(self.state_data()["edits"]["price.txt"]), b"800\n")
 
     def test_frozen_task_refuses_new_edits(self):
         self.freeze()

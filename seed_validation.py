@@ -274,8 +274,10 @@ def run_validation(client, *, kind, subject, workspace, command, environment, ti
         state = _new_state(adapter, "http://localhost", "validation")
         state_file.create(state)
         session = _session(adapter, state)
-        args = argparse.Namespace(workspace=workspace, prefix="", command=command,
-                                  command_timeout=timeout)
+        # A validator certifies the whole snapshot, so no narrower dependency
+        # set applies here.
+        args = argparse.Namespace(workspace=workspace, prefix="", depends=[],
+                                  command=command, command_timeout=timeout)
         result = _run(args, state, session, state_file)
         # Generated outputs may be new files. Versioned inputs must be unchanged.
         modified_inputs = sorted(path for path in session.edits if path in files)
